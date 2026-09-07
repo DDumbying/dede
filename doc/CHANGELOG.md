@@ -114,3 +114,26 @@ Architectural groundwork, not a user-facing feature by itself: `main.c`'s ~240-l
 
 - Project renamed from `ded` ("Dramatic EDitor") to **dede** ("Dramatically Expanded Dramatic Editor") to reflect that this is now a personal, actively-expanded fork rather than upstream `ded` itself. Binary name, window title, and config filename (`dede.conf`) all follow.
 - This changelog, the roadmap, and known-quirks/TODO notes moved out of the repo-root `PROGRESS.md` into `doc/` (`CHANGELOG.md`, `ROADMAP.md`, `NOTES.md`), so project docs have a real home instead of one growing file.
+
+### 2.12 Logo refresh + splash/about screen layout
+`src/app.c`, `assets/dede.png`
+
+- `assets/dede.png` replaced with new logo art that already has the "dede" wordmark drawn into it below the mark itself. The separate `draw_centered_line(..., "dede", ...)` row previously drawn underneath the logo on both the splash and About screens was removed, since it now just duplicated the image.
+- Both screens used to start drawing at a fixed pixel offset from the top of the window, so on anything taller than a small window the content sat in a cramped block with a large empty margin below it. Rewrote both to compute their total content height up front (logo + menu/about rows + optional recent-files block + hint line) and start drawing at half that height, so the whole block is vertically centered on the window's actual center at any window size, not just horizontally.
+- Added a subtle horizontal divider between the menu and the "Recent Files" section on the splash screen for a bit of visual grouping.
+- New helpers: `logo_world_height()` (works out the logo's on-screen height without drawing it, so a caller can lay out the rest of the screen around it first) and `draw_divider()`.
+
+### 2.13 Glyph atlas texture bleeding ("tearing" between characters)
+`src/free_glyph.c`
+
+- Reported as characters looking "torn"/low quality, worst on the splash screen. Root cause: `free_glyph_atlas_glyph()` packed every glyph edge-to-edge into the shared atlas texture with zero gap between them, sampled with `GL_LINEAR`. Since it's one shared texture, bilinear filtering at a glyph's boundary blended in a sliver of whatever glyph happened to be packed next to it — visible as faint vertical seams between characters, worse the more the text is magnified (the splash screen renders the same glyphs at roughly 3x the on-screen size of normal editing view, so a bleed invisible at editing zoom was clearly visible there).
+- Fix, done in two passes: added `GLYPH_ATLAS_PADDING`, a transparent gap left around every packed glyph (both on the normal packing advance and when wrapping to a new shelf row). 1px fully fixed it at normal editing zoom but left a faint residual at the splash screen's higher magnification, confirmed with a raw pixel dump of the affected region (not just eyeballing a zoomed screenshot); raised to 4px, which fixed it there too, re-verified the same way plus a re-check that normal editing view was still clean.
+- Also zero-initialized the atlas texture up front — `glTexImage2D` was previously called with a NULL data pointer, leaving its contents driver-defined, so the new padding gaps (and any not-yet-packed shelf space) are now guaranteed transparent black instead of possibly garbage.
+- Along the way, changed `Glyph_Metric.ax`/`ay` (advance width) from truncating to a whole pixel (`glyph->advance.x >> 6`) to keeping its true 1/64px precision (`/ 64.0f`) — a real rounding bug (every glyph's cursor advance was silently rounded down by up to just under a pixel), though on this font/size it turned out not to be the cause of the seam above; kept as a correctness fix regardless.
+
+### 2.14 Block cursor no longer hides the character underneath
+`src/editor.c`
+
+- The Normal-mode block cursor was drawn as a fully opaque white rectangle after the text, completely covering whatever character it sat on — you couldn't tell what you were standing on.
+- Now redraws that one character on top of the block afterward, in the editor's own background color (`0x181818`), matching how a terminal's reverse-video block cursor behaves. Reuses the exact source bytes already decoded for sizing the cursor's width, and positions the glyph using the same y-baseline the normal text-rendering loop uses (the cursor block's own vertical anchor is nudged by `CURSOR_OFFSET` for visual alignment and isn't the same baseline).
+- Only fires when there's an actual printable character under the cursor; past end-of-buffer, on whitespace, or on a control character like `\n`, it's left as a plain block since there's nothing to preserve.

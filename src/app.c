@@ -21,6 +21,8 @@
 #include "./common.h"
 #include "./vim.h"
 #include "./command.h"
+#include "./image.h"
+#include "./sv.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -31,6 +33,7 @@ static Simple_Renderer sr = {0};
 static Editor editor = {0};
 static File_Browser fb = {0};
 static Vim_State vim = {0};
+static Image_Texture logo_image = {0}; // zeroed (texture == 0) if assets/dede.png failed to load - splash/about just skip drawing it then
 
 // When false, vim_handle_key/vim_handle_browser_key are never called -
 // Vim is fully inert, not just "returning false a lot".
@@ -44,6 +47,8 @@ typedef enum {
     APP_MODE_SAVE_AS, // typing a destination path for F2/Ctrl+Shift+S
     APP_MODE_CONFIRM, // "you have unsaved changes, proceed anyway? (y/n)"
     APP_MODE_COMMAND, // typing an Ex-style :command (Vim Normal mode only)
+    APP_MODE_SPLASH,  // startup landing page when no file was given on the command line
+    APP_MODE_ABOUT,   // reached from the splash screen's About item
 } App_Mode;
 
 // What to do once APP_MODE_CONFIRM's y/n is answered - set by
@@ -57,6 +62,18 @@ typedef enum {
 static App_Mode mode = APP_MODE_EDITOR;
 static Confirm_Action pending_action = CONFIRM_ACTION_QUIT;
 static bool quit = false;
+
+// The splash screen's fixed action rows; recent files (if any) continue
+// the same selectable index space right after these.
+#define SPLASH_MENU_COUNT 5
+static const char *splash_menu_labels[SPLASH_MENU_COUNT] = {
+    "New File",
+    "Open File...",
+    "GitHub Repository",
+    "Docs & Configuration",
+    "About",
+};
+static size_t splash_cursor = 0;
 
 // True for one SDL_TEXTINPUT following a SDL_KEYDOWN that changed `mode` -
 // that trailing text belongs to the mode we left and must never be typed.
@@ -103,6 +120,124 @@ static void flash_error(const char *fmt, ...)
     vsnprintf(error_message, sizeof(error_message), fmt, args);
     va_end(args);
     error_message_time = SDL_GetTicks();
+}
+
+// Recent files, shown on the splash screen. Global to the user (not
+// per-project like ./dede.conf), so this lives in $HOME rather than CWD.
+#define RECENT_FILES_CAP 8
+static char recent_files[RECENT_FILES_CAP][SAVE_AS_PATH_CAP];
+static size_t recent_files_count = 0;
+
+static void recent_files_path(char *buf, size_t cap)
+{
+    const char *home = getenv("HOME");
+    snprintf(buf, cap, "%s/.dede_recent_files", home != NULL ? home : ".");
+}
+
+// Reads the persisted list, keeping only entries that still exist on
+// disk - a file deleted/moved since last recorded silently drops off
+// the splash screen instead of showing a dead link.
+static void recent_files_load(void)
+{
+    char path[SAVE_AS_PATH_CAP];
+    recent_files_path(path, sizeof(path));
+
+    String_Builder sb = {0};
+    if (read_entire_file(path, &sb) != 0) {
+        free(sb.items);
+        return;
+    }
+
+    String_View sv = sb_to_sv(sb);
+    while (sv.count > 0 && recent_files_count < RECENT_FILES_CAP) {
+        String_View line = sv_chop_by_delim(&sv, '\n');
+        if (line.count == 0 || line.count >= SAVE_AS_PATH_CAP) continue;
+
+        char candidate[SAVE_AS_PATH_CAP];
+        memcpy(candidate, line.data, line.count);
+        candidate[line.count] = '\0';
+
+        File_Type ft;
+        if (type_of_file(candidate, &ft) == 0 && ft == FT_REGULAR) {
+            memcpy(recent_files[recent_files_count], candidate, line.count + 1);
+            recent_files_count += 1;
+        }
+    }
+
+    free(sb.items);
+}
+
+static void recent_files_write(void)
+{
+    char path[SAVE_AS_PATH_CAP];
+    recent_files_path(path, sizeof(path));
+
+    String_Builder sb = {0};
+    for (size_t i = 0; i < recent_files_count; ++i) {
+        sb_append_cstr(&sb, recent_files[i]);
+        sb_append_cstr(&sb, "\n");
+    }
+    write_entire_file(path, sb.items, sb.count);
+    free(sb.items);
+}
+
+// Records `path` as the most recently opened file - resolves to an
+// absolute path first (falling back to the raw string if that fails)
+// so it still resolves correctly from a different working directory
+// next launch, dedupes, prepends, and caps the persisted list length.
+static void recent_files_add(const char *path)
+{
+    char resolved[SAVE_AS_PATH_CAP];
+    if (realpath(path, resolved) == NULL) {
+        snprintf(resolved, sizeof(resolved), "%s", path);
+    }
+
+    size_t existing = recent_files_count;
+    for (size_t i = 0; i < recent_files_count; ++i) {
+        if (strcmp(recent_files[i], resolved) == 0) {
+            existing = i;
+            break;
+        }
+    }
+    bool found = existing < recent_files_count;
+    size_t shift_count = found ? existing : recent_files_count;
+    if (shift_count >= RECENT_FILES_CAP) shift_count = RECENT_FILES_CAP - 1;
+    for (size_t i = shift_count; i > 0; --i) {
+        memcpy(recent_files[i], recent_files[i - 1], SAVE_AS_PATH_CAP);
+    }
+    snprintf(recent_files[0], SAVE_AS_PATH_CAP, "%s", resolved);
+    if (!found && recent_files_count < RECENT_FILES_CAP) recent_files_count += 1;
+
+    recent_files_write();
+}
+
+// Removes a stale entry (its file no longer opens) from the in-memory
+// list and rewrites the persisted one - called when the splash screen
+// fails to open something it listed as recent.
+static void recent_files_remove(size_t index)
+{
+    assert(index < recent_files_count);
+    for (size_t i = index; i + 1 < recent_files_count; ++i) {
+        memcpy(recent_files[i], recent_files[i + 1], SAVE_AS_PATH_CAP);
+    }
+    recent_files_count -= 1;
+    recent_files_write();
+}
+
+// The URL is always one of this file's own fixed literals, never user
+// input, so shelling out here carries no injection risk.
+static void open_url(const char *url)
+{
+#ifdef _WIN32
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+#else
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "xdg-open '%s' >/dev/null 2>&1 &", url);
+#endif
+    if (system(cmd) != 0) {
+        flash_error("Could not open %s in a browser", url);
+    }
 }
 
 // Carries out a Confirm_Action - either request_action skipped the
@@ -169,6 +304,21 @@ static void ui_bar_camera_begin(Simple_Renderer *sr, float *out_half_w, float *o
     sr->camera_pos = vec2f(*out_half_w, *out_half_h);
 }
 
+// Writes "path+suffix" into out, or - if that's wider than `available`
+// world units - ".../basename+suffix" instead. Shared by the status
+// bar's filename and the splash screen's recent-files list.
+static void elide_path_to_fit(Free_Glyph_Atlas *atlas, const char *path, const char *suffix, float available, char *out, size_t out_cap)
+{
+    snprintf(out, out_cap, "%s%s", path, suffix);
+    Vec2f measure = vec2fs(0.0f);
+    free_glyph_atlas_measure_line_sized(atlas, out, strlen(out), &measure);
+    if (measure.x > available) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        snprintf(out, out_cap, ".../%s%s", base, suffix);
+    }
+}
+
 // Single bar pinned to the bottom edge, always exactly UI_BAR_HEIGHT_PX
 // pixels tall regardless of the document's own pan/zoom. Normally shows
 // the permanent status (filename + dirty marker on the left, 1-based
@@ -217,16 +367,8 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
         // lead-in) if the full path would otherwise run into line:col.
         const char *path = editor.file_path.count > 0 ? editor.file_path.items : "[No Name]";
         const char *dirty_marker = editor.dirty ? " [+]" : "";
-        snprintf(left, sizeof(left), "%s%s", path, dirty_marker);
-
-        Vec2f left_measure = vec2fs(0.0f);
-        free_glyph_atlas_measure_line_sized(atlas, left, strlen(left), &left_measure);
         float available = 2.0f * half_w - 2.0f * pad - right_measure.x - pad;
-        if (left_measure.x > available) {
-            const char *base = strrchr(path, '/');
-            base = base ? base + 1 : path;
-            snprintf(left, sizeof(left), ".../%s%s", base, dirty_marker);
-        }
+        elide_path_to_fit(atlas, path, dirty_marker, available, left, sizeof(left));
     }
 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
@@ -247,6 +389,268 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
 
     sr->camera_pos = saved_camera_pos;
     sr->camera_scale = saved_camera_scale;
+}
+
+// Fixed zoom for the splash/about screens - independent of both the
+// document's own camera and the status bar's UI_TEXT_SCALE, since a
+// welcome screen wants noticeably bigger text than a status line.
+#define SPLASH_TEXT_SCALE 0.35f
+#define SPLASH_ROW_SPACING ((float) FREE_GLYPH_FONT_SIZE * 1.4f)
+
+// The logo art (assets/dede.png) already has the "dede" wordmark drawn
+// into it below the mark itself, so screens using it don't also draw a
+// separate "dede" text line underneath.
+#define SPLASH_LOGO_SIZE_PX 132.0f
+#define ABOUT_LOGO_SIZE_PX 104.0f
+
+// World-space height `draw_logo` will use for `size_px`, without
+// actually drawing anything - lets a caller lay out its whole screen
+// (to vertically center it) before it starts drawing top-down.
+static float logo_world_height(float size_px)
+{
+    if (logo_image.texture == 0) return 0.0f;
+    float aspect = logo_image.height > 0 ? (float) logo_image.width / (float) logo_image.height : 1.0f;
+    float w = size_px / SPLASH_TEXT_SCALE;
+    return w / aspect;
+}
+
+// Draws the logo (a no-op if it failed to load at startup) centered
+// horizontally with its top edge at world y=`top_y`, `size_px` on-screen
+// pixels wide (height follows from the image's own aspect ratio).
+// Returns the world-space height actually used, 0 if there's no logo,
+// so the caller can advance its layout cursor past it either way.
+static float draw_logo(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, float top_y, float size_px)
+{
+    if (logo_image.texture == 0) return 0.0f;
+
+    float aspect = logo_image.height > 0 ? (float) logo_image.width / (float) logo_image.height : 1.0f;
+    float w = size_px / SPLASH_TEXT_SCALE;
+    float h = w / aspect;
+
+    glBindTexture(GL_TEXTURE_2D, logo_image.texture);
+    simple_renderer_set_shader(sr, SHADER_FOR_IMAGE);
+    simple_renderer_image_rect(sr, vec2f(-w / 2.0f, top_y), vec2f(w, -h), vec2f(0.0f, 0.0f), vec2f(1.0f, 1.0f), vec4fs(1.0f));
+    simple_renderer_flush(sr);
+    glBindTexture(GL_TEXTURE_2D, atlas->glyphs_texture);
+
+    return h;
+}
+
+// Thin horizontal rule, `width_px` on-screen pixels wide, centered
+// horizontally, for separating sections of the splash screen without
+// a heavier full text row.
+static void draw_divider(Simple_Renderer *sr, float y, float width_px)
+{
+    float w = width_px / SPLASH_TEXT_SCALE;
+    float thickness = 1.0f / SPLASH_TEXT_SCALE;
+    simple_renderer_flush(sr);
+    simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+    simple_renderer_solid_rect(sr, vec2f(-w / 2.0f, y), vec2f(w, thickness), hex_to_vec4f(0x2A2A2AFF));
+    simple_renderer_flush(sr);
+    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+}
+
+// Draws `text` centered horizontally at world y=`y` (its baseline).
+static void draw_centered_line(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, float y, Vec4f color)
+{
+    Vec2f measure = vec2fs(0.0f);
+    free_glyph_atlas_measure_line_sized(atlas, text, strlen(text), &measure);
+    Vec2f pos = vec2f(-measure.x / 2.0f, y);
+    free_glyph_atlas_render_line_sized(atlas, sr, text, strlen(text), &pos, color);
+}
+
+// A selectable splash-screen row: same centered text, plus a highlight
+// bar behind it when it's the current selection. Shared by the fixed
+// menu items and the recent-files list right below them, which both
+// live in the same selectable index space (see APP_MODE_SPLASH's
+// SDL_KEYDOWN handling).
+static void draw_splash_row(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const char *text, float y, bool selected)
+{
+    if (selected) {
+        Vec2f measure = vec2fs(0.0f);
+        free_glyph_atlas_measure_line_sized(atlas, text, strlen(text), &measure);
+        float pad = 16.0f / SPLASH_TEXT_SCALE;
+        // Flush any text queued by earlier calls (e.g. the title, or a
+        // previous row's label) before switching shaders - otherwise this
+        // flush would draw that pending text-shader geometry through the
+        // color shader instead (solid quads where glyphs should be).
+        simple_renderer_flush(sr);
+        simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+        simple_renderer_solid_rect(
+            sr,
+            vec2f(-measure.x / 2.0f - pad / 2.0f, y - (float) FREE_GLYPH_FONT_SIZE * 0.25f),
+            vec2f(measure.x + pad, (float) FREE_GLYPH_FONT_SIZE * 1.1f),
+            hex_to_vec4f(0x2A2A2AFF));
+        simple_renderer_flush(sr);
+        simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+    }
+    draw_centered_line(sr, atlas, text, y, selected ? hex_to_vec4f(0xFFDD33FF) : vec4fs(0.75f));
+}
+
+// Startup landing page when dede is launched with no file argument: the
+// logo, the fixed action menu, and (if there are any) recent files right
+// below it in the same selectable list - or just the logo and menu on a
+// first run with nothing recent yet.
+static void draw_splash_screen(SDL_Window *window, Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
+{
+    int w, h;
+    SDL_GetWindowSize(window, &w, &h);
+    sr->resolution = vec2f(w, h);
+    sr->time = (float) SDL_GetTicks() / 1000.0f;
+
+    Vec2f saved_camera_pos = sr->camera_pos;
+    float saved_camera_scale = sr->camera_scale;
+
+    sr->camera_scale = SPLASH_TEXT_SCALE;
+    sr->camera_pos = vec2f(0.0f, 0.0f); // world (0,0) is screen center at any window size
+
+    float logo_h = logo_world_height(SPLASH_LOGO_SIZE_PX);
+    float gap_after_logo = SPLASH_ROW_SPACING * (logo_h > 0.0f ? 1.1f : 0.0f);
+    bool has_recent = recent_files_count > 0;
+
+    // Lay the whole screen out top-to-bottom in world units first, so
+    // its vertical center (not just its horizontal center) lands on
+    // the window's actual center regardless of window height - a fixed
+    // top offset (the old approach) left a growing dead zone below the
+    // content on anything taller than a small window.
+    float content_h = logo_h + gap_after_logo
+        + (float) SPLASH_MENU_COUNT * SPLASH_ROW_SPACING
+        + (has_recent ? SPLASH_ROW_SPACING * (1.6f + (float) recent_files_count) : 0.0f)
+        + SPLASH_ROW_SPACING * 1.4f; // gap + hint line
+
+    float y = content_h / 2.0f;
+    y -= draw_logo(sr, atlas, y, SPLASH_LOGO_SIZE_PX);
+    y -= gap_after_logo;
+
+    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+
+    for (size_t i = 0; i < SPLASH_MENU_COUNT; ++i) {
+        draw_splash_row(sr, atlas, splash_menu_labels[i], y, i == splash_cursor);
+        y -= SPLASH_ROW_SPACING;
+    }
+
+    if (has_recent) {
+        y -= SPLASH_ROW_SPACING * 0.2f;
+        draw_divider(sr, y, 220.0f);
+        y -= SPLASH_ROW_SPACING * 0.9f;
+        draw_centered_line(sr, atlas, "Recent Files", y, vec4fs(0.5f));
+        y -= SPLASH_ROW_SPACING;
+
+        float available = (sr->resolution.x * 0.7f) / SPLASH_TEXT_SCALE;
+        for (size_t i = 0; i < recent_files_count; ++i) {
+            char label[SAVE_AS_PATH_CAP];
+            elide_path_to_fit(atlas, recent_files[i], "", available, label, sizeof(label));
+            draw_splash_row(sr, atlas, label, y, SPLASH_MENU_COUNT + i == splash_cursor);
+            y -= SPLASH_ROW_SPACING;
+        }
+    }
+
+    y -= SPLASH_ROW_SPACING * 0.4f;
+    draw_centered_line(sr, atlas, "Up/Down or j/k  -  Enter to select  -  Ctrl+Q to quit", y, vec4fs(0.4f));
+
+    if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
+        y -= SPLASH_ROW_SPACING;
+        draw_centered_line(sr, atlas, error_message, y, hex_to_vec4f(0xFF6B6BFF));
+    }
+
+    simple_renderer_flush(sr);
+
+    sr->camera_pos = saved_camera_pos;
+    sr->camera_scale = saved_camera_scale;
+}
+
+// Reached from the splash screen's About row.
+static void draw_about_screen(SDL_Window *window, Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
+{
+    int w, h;
+    SDL_GetWindowSize(window, &w, &h);
+    sr->resolution = vec2f(w, h);
+    sr->time = (float) SDL_GetTicks() / 1000.0f;
+
+    Vec2f saved_camera_pos = sr->camera_pos;
+    float saved_camera_scale = sr->camera_scale;
+
+    sr->camera_scale = SPLASH_TEXT_SCALE;
+    sr->camera_pos = vec2f(0.0f, 0.0f);
+
+    static const char *lines[] = {
+        "Dramatically Expanded Dramatic Editor",
+        "A personal fork of ded by Alexey Kutepov (tsoding)",
+        "Maintained by saeeedhany",
+        "MIT License",
+    };
+
+    float logo_h = logo_world_height(ABOUT_LOGO_SIZE_PX);
+    float gap_after_logo = SPLASH_ROW_SPACING * (logo_h > 0.0f ? 1.0f : 0.0f);
+    float content_h = logo_h + gap_after_logo
+        + (float) ARRAY_LEN(lines) * SPLASH_ROW_SPACING
+        + SPLASH_ROW_SPACING * 1.4f; // gap + "press escape" line
+
+    float y = content_h / 2.0f;
+    y -= draw_logo(sr, atlas, y, ABOUT_LOGO_SIZE_PX);
+    y -= gap_after_logo;
+
+    simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+    for (size_t i = 0; i < ARRAY_LEN(lines); ++i) {
+        draw_centered_line(sr, atlas, lines[i], y, i == 0 ? vec4fs(0.9f) : vec4fs(0.7f));
+        y -= SPLASH_ROW_SPACING;
+    }
+
+    y -= SPLASH_ROW_SPACING * 0.4f;
+    draw_centered_line(sr, atlas, "Press Escape to return", y, vec4fs(0.45f));
+
+    simple_renderer_flush(sr);
+
+    sr->camera_pos = saved_camera_pos;
+    sr->camera_scale = saved_camera_scale;
+}
+
+// Opens `path` from the splash screen (Docs or a recent-file row): on
+// success, lands in the editor and records/refreshes it as recent; on
+// failure, flashes the error and - for a recent-file row specifically -
+// drops the now-stale entry rather than leaving a dead link listed.
+static void splash_open_file(const char *path, bool is_recent_row, size_t recent_index)
+{
+    Errno err = editor_load_from_file(&editor, path);
+    if (err != 0) {
+        flash_error("Could not open file %s: %s", path, strerror(err));
+        if (is_recent_row) recent_files_remove(recent_index);
+        return;
+    }
+    vim = vim_state_init();
+    editor.cursor_block = vim_enabled;
+    mode = APP_MODE_EDITOR;
+    recent_files_add(path);
+}
+
+// Activates the splash screen's current selection (Enter).
+static void splash_activate(size_t index)
+{
+    if (index < SPLASH_MENU_COUNT) {
+        switch (index) {
+        case 0: // New File
+            mode = APP_MODE_EDITOR;
+            break;
+        case 1: // Open File...
+            mode = APP_MODE_FILE_BROWSER;
+            break;
+        case 2: // GitHub Repository
+            open_url("https://github.com/saeeedhany/ded");
+            break;
+        case 3: // Docs & Configuration
+            splash_open_file("README.md", false, 0);
+            break;
+        case 4: // About
+            mode = APP_MODE_ABOUT;
+            break;
+        }
+        return;
+    }
+
+    size_t recent_index = index - SPLASH_MENU_COUNT;
+    if (recent_index < recent_files_count) {
+        splash_open_file(recent_files[recent_index], true, recent_index);
+    }
 }
 
 // Commands - see command.h. Movement commands don't call
@@ -655,11 +1059,15 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
 {
     simple_renderer_init(&sr);
     free_glyph_atlas_init(&atlas, face);
+    image_texture_load(&logo_image, "./assets/dede.png"); // failure just means the splash/about screens draw without it
+    glBindTexture(GL_TEXTURE_2D, atlas.glyphs_texture); // image_texture_load leaves its own texture bound - every other draw call in the app assumes the atlas is bound by default
 
     editor.indent_width = cfg->tab_width;
     editor.line_numbers = cfg->line_numbers;
     editor.relative_line_numbers = cfg->relative_line_numbers;
     vim_enabled = cfg->vim_mode;
+
+    recent_files_load();
 
     Errno err;
     if (argc > 1) {
@@ -669,6 +1077,9 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
             fprintf(stderr, "ERROR: Could not read file %s: %s\n", file_path, strerror(err));
             return 1;
         }
+        recent_files_add(file_path);
+    } else {
+        mode = APP_MODE_SPLASH;
     }
 
     const char *dir_path = ".";
@@ -741,6 +1152,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                                             vim = vim_state_init();
                                             editor.cursor_block = vim_enabled;
                                             mode = APP_MODE_EDITOR;
+                                            recent_files_add(file_path);
                                         }
                                     }
                                     break;
@@ -795,6 +1207,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                                 // stay in the prompt so the path can be fixed
                             } else {
                                 mode = APP_MODE_EDITOR;
+                                recent_files_add(save_as_path);
                             }
                         }
                     }
@@ -835,6 +1248,58 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                         backspace_utf8(command_line, &command_line_len);
                     }
                     break;
+
+                    default:
+                        break;
+                    }
+                } break;
+
+                case APP_MODE_SPLASH: {
+                    size_t row_count = SPLASH_MENU_COUNT + recent_files_count;
+                    bool ctrl = event.key.keysym.mod & KMOD_CTRL;
+
+                    switch (event.key.keysym.sym) {
+                    case SDLK_q:
+                        if (ctrl) quit = true;
+                        break;
+
+                    case SDLK_UP:
+                        if (splash_cursor > 0) splash_cursor -= 1;
+                        break;
+
+                    case SDLK_DOWN:
+                        if (splash_cursor + 1 < row_count) splash_cursor += 1;
+                        break;
+
+                    case SDLK_j:
+                        if (vim_enabled && splash_cursor + 1 < row_count) splash_cursor += 1;
+                        break;
+
+                    case SDLK_k:
+                        if (vim_enabled && splash_cursor > 0) splash_cursor -= 1;
+                        break;
+
+                    case SDLK_RETURN: {
+                        splash_activate(splash_cursor);
+                        // A failed recent-file open drops that entry
+                        // (recent_files_remove) while staying on the
+                        // splash screen - keep the selection in range.
+                        size_t new_row_count = SPLASH_MENU_COUNT + recent_files_count;
+                        if (splash_cursor >= new_row_count) splash_cursor = new_row_count - 1;
+                    }
+                    break;
+
+                    default:
+                        break;
+                    }
+                } break;
+
+                case APP_MODE_ABOUT: {
+                    switch (event.key.keysym.sym) {
+                    case SDLK_ESCAPE:
+                    case SDLK_RETURN:
+                        mode = APP_MODE_SPLASH;
+                        break;
 
                     default:
                         break;
@@ -915,6 +1380,14 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                 }
                 break;
 
+                case APP_MODE_SPLASH:
+                    // Nothing to type - navigation is handled entirely in SDL_KEYDOWN above.
+                    break;
+
+                case APP_MODE_ABOUT:
+                    // Nothing to type here either.
+                    break;
+
                 case APP_MODE_EDITOR:
                     if (vim_take_consumed_textinput(&vim)) {
                         // key already claimed by vim_handle_key; don't also type it
@@ -946,7 +1419,11 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
         glClearColor(bg.x, bg.y, bg.z, bg.w);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (mode == APP_MODE_FILE_BROWSER) {
+        if (mode == APP_MODE_SPLASH) {
+            draw_splash_screen(window, &sr, &atlas);
+        } else if (mode == APP_MODE_ABOUT) {
+            draw_about_screen(window, &sr, &atlas);
+        } else if (mode == APP_MODE_FILE_BROWSER) {
             fb_render(&fb, window, &atlas, &sr);
         } else {
             editor_render(window, &atlas, &sr, &editor);

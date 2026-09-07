@@ -905,6 +905,12 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
     {
         float CURSOR_WIDTH = 5.0f;
+        // Bytes/length of the character under a block cursor, so it can
+        // be redrawn on top of the block afterward (see below). Stays
+        // NULL past end-of-buffer, on a control character like '\n', or
+        // in Insert mode's thin-bar cursor - nothing to preserve there.
+        const char *cursor_glyph_bytes = NULL;
+        size_t cursor_glyph_len = 0;
         if (editor->cursor_block) {
             // Normal-mode block cursor: fill the actual glyph cell under
             // the cursor (its real advance width), not just a thicker bar.
@@ -912,7 +918,11 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
             // or for control characters like '\n'.
             uint32_t cp = ' ';
             if (editor->cursor < editor->data.count) {
-                utf8_decode(editor->data.items + editor->cursor, editor->data.count - editor->cursor, &cp);
+                size_t len = utf8_decode(editor->data.items + editor->cursor, editor->data.count - editor->cursor, &cp);
+                if (cp >= 32) {
+                    cursor_glyph_bytes = editor->data.items + editor->cursor;
+                    cursor_glyph_len = len;
+                }
             }
             if (cp < 32) cp = ' ';
             CURSOR_WIDTH = free_glyph_atlas_glyph(atlas, cp).ax;
@@ -928,6 +938,23 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
                 sr,
                 cursor_pos, vec2f(CURSOR_WIDTH, FREE_GLYPH_FONT_SIZE),
                 vec4fs(1));
+
+            if (cursor_glyph_bytes != NULL) {
+                // Terminal-style reverse video: redraw the character on
+                // top of the block in the editor's own background color
+                // instead of leaving it fully hidden underneath an
+                // opaque highlight (the old behavior - see the bug this
+                // fixes). Uses the token loop's own y convention
+                // (no CURSOR_OFFSET, which only nudges the block's own
+                // vertical placement) so the glyph lands exactly where
+                // it would have without a cursor over it.
+                simple_renderer_flush(sr);
+                simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+                Vec2f glyph_pos = vec2f(cursor_pos.x, -(float) editor_cursor_row(editor) * FREE_GLYPH_FONT_SIZE);
+                free_glyph_atlas_render_line_sized(atlas, sr, cursor_glyph_bytes, cursor_glyph_len, &glyph_pos, hex_to_vec4f(0x181818FF));
+                simple_renderer_flush(sr);
+                simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+            }
         }
 
         simple_renderer_flush(sr);

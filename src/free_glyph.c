@@ -1,7 +1,18 @@
 #include <assert.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 #include "./free_glyph.h"
 #include "./common.h"
+
+// Gap (in atlas texels) left around every packed glyph. GL_LINEAR
+// sampling blends across whatever's adjacent in the shared atlas
+// texture, so with zero gap the edge row/column of one glyph bleeds a
+// sliver of its neighbor's pixels into the rendered quad (visible as
+// thin vertical "tearing" between characters, worse the more the text
+// is magnified). A 1px transparent border on every side is enough for
+// bilinear filtering to blend with transparent black instead.
+#define GLYPH_ATLAS_PADDING 4
 
 void free_glyph_atlas_init(Free_Glyph_Atlas *atlas, FT_Face face)
 {
@@ -19,6 +30,14 @@ void free_glyph_atlas_init(Free_Glyph_Atlas *atlas, FT_Face face)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    // Zero-initialize the whole atlas (glTexImage2D with a NULL pointer
+    // leaves the texture's contents driver-defined, which used to mean
+    // the padding gaps below - and any not-yet-packed shelf space -
+    // could sample as garbage instead of transparent black).
+    size_t atlas_bytes = (size_t) atlas->atlas_width * (size_t) atlas->atlas_height;
+    void *blank = calloc(1, atlas_bytes);
+    assert(blank != NULL && "Buy more RAM lol");
     glTexImage2D(
         GL_TEXTURE_2D,
         0,
@@ -28,7 +47,8 @@ void free_glyph_atlas_init(Free_Glyph_Atlas *atlas, FT_Face face)
         0,
         GL_RED,
         GL_UNSIGNED_BYTE,
-        NULL);
+        blank);
+    free(blank);
 
     // Pre-warm printable ASCII (including '?', the fallback glyph every
     // on-demand miss degrades to) so the common case has zero first-paint
@@ -63,12 +83,12 @@ Glyph_Metric free_glyph_atlas_glyph(Free_Glyph_Atlas *atlas, uint32_t codepoint)
     FT_UInt bw = glyph->bitmap.width;
     FT_UInt bh = glyph->bitmap.rows;
 
-    if (atlas->pen_x + bw > atlas->atlas_width) {
+    if (atlas->pen_x + bw + GLYPH_ATLAS_PADDING > atlas->atlas_width) {
         atlas->pen_x = 0;
-        atlas->pen_y += atlas->row_height;
+        atlas->pen_y += atlas->row_height + GLYPH_ATLAS_PADDING;
         atlas->row_height = 0;
     }
-    if (atlas->pen_y + bh > atlas->atlas_height) {
+    if (atlas->pen_y + bh + GLYPH_ATLAS_PADDING > atlas->atlas_height) {
         if (codepoint == '?') {
             Glyph_Metric empty = {0};
             return empty;
@@ -90,8 +110,18 @@ Glyph_Metric free_glyph_atlas_glyph(Free_Glyph_Atlas *atlas, uint32_t codepoint)
 
     Glyph_Entry entry = {0};
     entry.codepoint = codepoint;
-    entry.metric.ax = glyph->advance.x >> 6;
-    entry.metric.ay = glyph->advance.y >> 6;
+    // advance is 26.6 fixed-point (1/64px); `>> 6` used to truncate the
+    // fractional pixel away entirely, so every glyph's cursor advance
+    // was rounded down by up to just-under-1px. That's invisible at
+    // normal editing zoom but at higher magnification (the splash
+    // screen's larger on-screen text) it let some glyph pairs sit
+    // fractionally too close together, so their antialiased edges
+    // overlapped on screen - two semi-transparent edges alpha-blended
+    // on top of each other read as a faint bright seam between the
+    // two characters. Keeping the fraction (dividing instead of
+    // shifting) advances the pen by the font's true width.
+    entry.metric.ax = (float) glyph->advance.x / 64.0f;
+    entry.metric.ay = (float) glyph->advance.y / 64.0f;
     entry.metric.bw = (float) bw;
     entry.metric.bh = (float) bh;
     entry.metric.bl = (float) glyph->bitmap_left;
@@ -100,7 +130,7 @@ Glyph_Metric free_glyph_atlas_glyph(Free_Glyph_Atlas *atlas, uint32_t codepoint)
     entry.metric.ty = (float) atlas->pen_y / (float) atlas->atlas_height;
     da_append(&atlas->glyphs, entry);
 
-    atlas->pen_x += bw;
+    atlas->pen_x += bw + GLYPH_ATLAS_PADDING;
     if (bh > atlas->row_height) atlas->row_height = bh;
 
     return entry.metric;
