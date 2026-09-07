@@ -12,8 +12,7 @@
 // delete/put drive the editor's existing selection + system clipboard.
 //
 // Not implemented: text objects, named/numbered registers, marks,
-// macros, command-line mode (:w, :q), linewise dj/dk/dgg/dG with
-// operators, authentic linewise p/P.
+// macros, :%s substitution, authentic linewise p/P.
 
 typedef enum {
     VIM_MODE_NORMAL,

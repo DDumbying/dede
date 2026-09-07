@@ -54,6 +54,25 @@ static void vim_accumulate_count(Vim_State *vs, size_t digit)
     if (vs->count > 100000) vs->count = 100000;
 }
 
+// Shared by every dispatcher: a digit key (1-9, or 0 once a count has
+// already started) accumulates into vs->count instead of doing anything else.
+static bool vim_try_accumulate_digit(Vim_State *vs, SDL_Keysym key, bool shift)
+{
+    if (shift || key.sym < SDLK_0 || key.sym > SDLK_9) return false;
+    if (key.sym == SDLK_0 && vs->count == 0) return false;
+    vim_accumulate_count(vs, key.sym - SDLK_0);
+    return true;
+}
+
+// Shared "second key after a pending 'g'" check for gg/G-style jumps -
+// always consumes pending_g; returns whether this key completed it.
+static bool vim_try_pending_g(Vim_State *vs, SDL_Keysym key, bool shift, bool ctrl)
+{
+    if (!vs->pending_g) return false;
+    vs->pending_g = false;
+    return key.sym == SDLK_g && !shift && !ctrl;
+}
+
 static size_t vim_line_pos(const Editor *e, size_t line_number)
 {
     size_t row = line_number - 1;
@@ -94,39 +113,54 @@ static void vim_yank_range(Editor *e, size_t begin, size_t end)
     e->cursor = begin;
 }
 
-// [begin, end) for 'dd'/'yy' with `count` lines from the one containing
-// `pos`, newline included so the lines are fully removed - except the
-// buffer's last line, which eats the *previous* line's newline instead
-// since it has none of its own.
+// [begin, end) covering whole lines `row_a..row_b` (order-independent),
+// newline included so the lines are fully removed - except when the
+// last of them is the buffer's last line, which has none of its own
+// and so eats the *previous* line's newline instead.
+static void vim_linewise_range_rows(const Editor *e, size_t row_a, size_t row_b, size_t *out_begin, size_t *out_end)
+{
+    if (row_a > row_b) SWAP(size_t, row_a, row_b);
+
+    if (row_b + 1 < e->lines.count) {
+        *out_begin = e->lines.items[row_a].begin;
+        *out_end = e->lines.items[row_b + 1].begin;
+    } else if (row_a > 0) {
+        *out_begin = e->lines.items[row_a - 1].end;
+        *out_end = e->lines.items[row_b].end;
+    } else {
+        *out_begin = e->lines.items[row_a].begin;
+        *out_end = e->lines.items[row_b].end;
+    }
+}
+
+// [begin, end) for 'dd'/'yy' with `count` lines from the one containing `pos`.
 static void vim_linewise_range_n(const Editor *e, size_t pos, size_t count, size_t *out_begin, size_t *out_end)
 {
     if (count == 0) count = 1;
     size_t row = editor_row_at(e, pos);
     size_t last_row = row + count - 1;
     if (last_row >= e->lines.count) last_row = e->lines.count - 1;
-
-    if (last_row + 1 < e->lines.count) {
-        *out_begin = e->lines.items[row].begin;
-        *out_end = e->lines.items[last_row + 1].begin;
-    } else if (row > 0) {
-        *out_begin = e->lines.items[row - 1].end;
-        *out_end = e->lines.items[last_row].end;
-    } else {
-        *out_begin = e->lines.items[row].begin;
-        *out_end = e->lines.items[last_row].end;
-    }
+    vim_linewise_range_rows(e, row, last_row, out_begin, out_end);
 }
 
-// [begin, end) for 'cc': `count` lines' content merged into one,
-// excluding the newline after the last of them (unlike dd, cc keeps a line).
+// [begin, end) covering the content of lines `row_a..row_b` (order-
+// independent), excluding the newline after the last one (unlike the
+// linewise range above, 'cc' keeps a line rather than removing it).
+static void vim_line_content_range_rows(const Editor *e, size_t row_a, size_t row_b, size_t *out_begin, size_t *out_end)
+{
+    if (row_a > row_b) SWAP(size_t, row_a, row_b);
+    *out_begin = e->lines.items[row_a].begin;
+    *out_end = e->lines.items[row_b].end;
+}
+
+// [begin, end) for 'cc': `count` lines' content merged into one.
 static void vim_line_content_range_n(const Editor *e, size_t pos, size_t count, size_t *out_begin, size_t *out_end)
 {
     if (count == 0) count = 1;
     size_t row = editor_row_at(e, pos);
     size_t last_row = row + count - 1;
     if (last_row >= e->lines.count) last_row = e->lines.count - 1;
-    *out_begin = e->lines.items[row].begin;
-    *out_end = e->lines.items[last_row].end;
+    vim_line_content_range_rows(e, row, last_row, out_begin, out_end);
 }
 
 // Same idea, but for an already-known [begin, end) span (Visual linewise).
@@ -241,22 +275,33 @@ static void vim_delete_char_under_cursor(Editor *e, size_t count)
     vim_delete_range(e, begin, end);
 }
 
-static void vim_delete_to_line_end(Editor *e)
+// End of the line `count` lines below `pos` ('D'/'C' with a count act on
+// that line, not just the current one - same target row math as dd/cc).
+static size_t vim_line_end_n(const Editor *e, size_t pos, size_t count)
 {
-    size_t end = editor_find_line_end(e, e->cursor);
+    if (count == 0) count = 1;
+    size_t row = editor_row_at(e, pos);
+    size_t target_row = row + count - 1;
+    if (target_row >= e->lines.count) target_row = e->lines.count - 1;
+    return e->lines.items[target_row].end;
+}
+
+static void vim_delete_to_line_end(Editor *e, size_t count)
+{
+    size_t end = vim_line_end_n(e, e->cursor, count);
     if (e->cursor < end) vim_delete_range(e, e->cursor, end);
 }
 
-static void vim_change_to_line_end(Vim_State *vs, Editor *e)
+static void vim_change_to_line_end(Vim_State *vs, Editor *e, size_t count)
 {
-    vim_delete_to_line_end(e);
+    vim_delete_to_line_end(e, count);
     vim_enter_insert(vs, e);
 }
 
-static void vim_yank_line(Editor *e)
+static void vim_yank_line(Editor *e, size_t count)
 {
     size_t begin, end;
-    vim_linewise_range_n(e, e->cursor, 1, &begin, &end);
+    vim_linewise_range_n(e, e->cursor, count, &begin, &end);
     vim_yank_range(e, begin, end);
 }
 
@@ -300,21 +345,55 @@ static void vim_apply_pending_op(Vim_State *vs, Editor *e, size_t begin, size_t 
     }
 }
 
+// Linewise counterpart of vim_apply_pending_op: applies the pending
+// operator to whole lines row_a..row_b (order-independent).
+static void vim_apply_pending_linewise_op(Vim_State *vs, Editor *e, size_t row_a, size_t row_b)
+{
+    size_t begin, end;
+    if (vs->pending_op == VIM_OP_CHANGE) {
+        vim_line_content_range_rows(e, row_a, row_b, &begin, &end);
+    } else {
+        vim_linewise_range_rows(e, row_a, row_b, &begin, &end);
+    }
+    vim_apply_pending_op(vs, e, begin, end);
+}
+
 static bool vim_dispatch_pending_op(Vim_State *vs, Editor *e, SDL_Keysym key, bool shift, bool ctrl)
 {
     if (ctrl) {
         vs->pending_op = VIM_OP_NONE;
+        vs->pending_g = false;
         vs->count = 0;
         vs->pending_op_count = 0;
         return false;
     }
 
-    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
-        vim_accumulate_count(vs, key.sym - SDLK_0);
+    // Second key of "d gg"/"c gg"/"y gg" - a linewise jump to an absolute
+    // line (0 = buffer start), same target-line rule as plain 'gg'/'G'.
+    if (vs->pending_g) {
+        vs->pending_g = false;
+        if (key.sym == SDLK_g && !shift) {
+            size_t row = editor_row_at(e, e->cursor);
+            size_t line = vs->count ? vs->count : vs->pending_op_count;
+            size_t target_row = line ? line - 1 : 0;
+            if (target_row >= e->lines.count) target_row = e->lines.count - 1;
+            vs->count = 0;
+            vs->pending_op_count = 0;
+            vim_apply_pending_linewise_op(vs, e, row, target_row);
+            return true;
+        }
+        vs->pending_op = VIM_OP_NONE;
+        vs->count = 0;
+        vs->pending_op_count = 0;
+        if (key.sym == SDLK_ESCAPE) return false;
         return true;
     }
 
+    if (vim_try_accumulate_digit(vs, key, shift)) return true;
+
     size_t total_count = (vs->pending_op_count ? vs->pending_op_count : 1) * (vs->count ? vs->count : 1);
+    // Clamp the product: e.g. "99999d99999w" shouldn't drive a multi-billion-step loop.
+    if (total_count > e->data.count + 1) total_count = e->data.count + 1;
 
     bool is_same_letter =
         (vs->pending_op == VIM_OP_DELETE && key.sym == SDLK_d && !shift) ||
@@ -330,6 +409,39 @@ static bool vim_dispatch_pending_op(Vim_State *vs, Editor *e, SDL_Keysym key, bo
         vs->count = 0;
         vs->pending_op_count = 0;
         vim_apply_pending_op(vs, e, begin, end);
+        return true;
+    }
+
+    // dj/dk: linewise, `total_count` lines moved from the current one -
+    // e.g. "dj" (count 1) spans 2 lines, same product-of-counts rule as
+    // any other repeatable motion above.
+    if (key.sym == SDLK_j || key.sym == SDLK_k) {
+        size_t row = editor_row_at(e, e->cursor);
+        size_t target_row = key.sym == SDLK_j
+            ? (row + total_count >= e->lines.count ? e->lines.count - 1 : row + total_count)
+            : (total_count <= row ? row - total_count : 0);
+        vs->count = 0;
+        vs->pending_op_count = 0;
+        vim_apply_pending_linewise_op(vs, e, row, target_row);
+        return true;
+    }
+
+    // dgg/dG: linewise jump to an absolute line. Unlike dj/dk above, a
+    // count here names the target line directly rather than a repeat
+    // count, so it isn't multiplied - whichever count slot was typed
+    // (before the operator, or before g/G) is the one that's used.
+    if (key.sym == SDLK_g) {
+        if (!shift) {
+            vs->pending_g = true;
+            return true;
+        }
+        size_t row = editor_row_at(e, e->cursor);
+        size_t line = vs->count ? vs->count : vs->pending_op_count;
+        size_t target_row = line ? line - 1 : e->lines.count - 1;
+        if (target_row >= e->lines.count) target_row = e->lines.count - 1;
+        vs->count = 0;
+        vs->pending_op_count = 0;
+        vim_apply_pending_linewise_op(vs, e, row, target_row);
         return true;
     }
 
@@ -384,18 +496,12 @@ static bool vim_dispatch_visual_key(Vim_State *vs, Editor *e, SDL_Keysym key, bo
         return false;
     }
 
-    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
-        vim_accumulate_count(vs, key.sym - SDLK_0);
-        return true;
-    }
+    if (vim_try_accumulate_digit(vs, key, shift)) return true;
 
-    if (vs->pending_g) {
-        vs->pending_g = false;
-        if (key.sym == SDLK_g && !shift) {
-            vim_goto_begin_or_line(e, vs->count);
-            vs->count = 0;
-            return true;
-        }
+    if (vim_try_pending_g(vs, key, shift, ctrl)) {
+        vim_goto_begin_or_line(e, vs->count);
+        vs->count = 0;
+        return true;
     }
 
     size_t pos;
@@ -474,13 +580,17 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
         return vim_dispatch_visual_key(vs, e, key, shift, ctrl);
     }
 
-    if (vs->pending_g) {
-        vs->pending_g = false;
-        if (key.sym == SDLK_g && !shift && !ctrl) {
-            vim_goto_begin_or_line(e, vs->count);
-            vs->count = 0;
-            return true;
-        }
+    // Must come before the plain-gg check below: dgg/cgg/ygg's own second
+    // 'g' has to reach vim_dispatch_pending_op, not be stolen here as a
+    // bare cursor jump while an operator is still waiting on it.
+    if (vs->pending_op != VIM_OP_NONE) {
+        return vim_dispatch_pending_op(vs, e, key, shift, ctrl);
+    }
+
+    if (vim_try_pending_g(vs, key, shift, ctrl)) {
+        vim_goto_begin_or_line(e, vs->count);
+        vs->count = 0;
+        return true;
     }
 
     if (ctrl) {
@@ -490,14 +600,7 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
         return false;
     }
 
-    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
-        vim_accumulate_count(vs, key.sym - SDLK_0);
-        return true;
-    }
-
-    if (vs->pending_op != VIM_OP_NONE) {
-        return vim_dispatch_pending_op(vs, e, key, shift, ctrl);
-    }
+    if (vim_try_accumulate_digit(vs, key, shift)) return true;
 
     switch (key.sym) {
     case SDLK_i:
@@ -553,7 +656,7 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 
     case SDLK_d:
         if (shift) {
-            vim_delete_to_line_end(e);
+            vim_delete_to_line_end(e, vs->count);
             vs->count = 0;
         } else {
             vs->pending_op_count = vs->count;
@@ -564,7 +667,7 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 
     case SDLK_c:
         if (shift) {
-            vim_change_to_line_end(vs, e);
+            vim_change_to_line_end(vs, e, vs->count);
             vs->count = 0;
         } else {
             vs->pending_op_count = vs->count;
@@ -575,7 +678,7 @@ static bool vim_dispatch_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 
     case SDLK_y:
         if (shift) {
-            vim_yank_line(e);
+            vim_yank_line(e, vs->count);
             vs->count = 0;
         } else {
             vs->pending_op_count = vs->count;
@@ -620,18 +723,12 @@ bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key)
         return false;
     }
 
-    if (!shift && key.sym >= SDLK_0 && key.sym <= SDLK_9 && !(key.sym == SDLK_0 && vs->count == 0)) {
-        vim_accumulate_count(vs, key.sym - SDLK_0);
-        return true;
-    }
+    if (vim_try_accumulate_digit(vs, key, shift)) return true;
 
-    if (vs->pending_g) {
-        vs->pending_g = false;
-        if (key.sym == SDLK_g && !shift) {
-            fb->cursor = 0;
-            vs->count = 0;
-            return true;
-        }
+    if (vim_try_pending_g(vs, key, shift, ctrl)) {
+        fb->cursor = 0;
+        vs->count = 0;
+        return true;
     }
 
     size_t count = vs->count ? vs->count : 1;

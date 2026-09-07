@@ -96,41 +96,40 @@ void lexer_chop_char(Lexer *l, size_t len)
     for (size_t i = 0; i < len; ++i) {
         // TODO: get rid of this assert by checking the length of the choped prefix upfront
         assert(l->cursor < l->content_len);
-        char x = l->content[l->cursor];
+        unsigned char x = (unsigned char) l->content[l->cursor];
+        size_t pos = l->cursor;
         l->cursor += 1;
         if (x == '\n') {
             l->line += 1;
             l->bol = l->cursor;
             l->x = 0;
-        } else {
-            if (l->atlas) {
-                size_t glyph_index = x;
-                // TODO: support for glyphs outside of ASCII range
-                if (glyph_index >= GLYPH_METRICS_CAPACITY) {
-                    glyph_index = '?';
-                }
-                Glyph_Metric metric = l->atlas->metrics[glyph_index];
-                l->x += metric.ax;
-            }
+        } else if (l->atlas && !utf8_is_continuation(x)) {
+            // A continuation byte contributes no width of its own - the
+            // whole sequence's advance was already added when its lead
+            // byte (this branch, one call earlier) was chopped.
+            uint32_t cp;
+            utf8_decode(l->content + pos, l->content_len - pos, &cp);
+            Glyph_Metric metric = free_glyph_atlas_glyph(l->atlas, cp);
+            l->x += metric.ax;
         }
     }
 }
 
 void lexer_trim_left(Lexer *l)
 {
-    while (l->cursor < l->content_len && isspace(l->content[l->cursor])) {
+    while (l->cursor < l->content_len && isspace((unsigned char) l->content[l->cursor])) {
         lexer_chop_char(l, 1);
     }
 }
 
 bool is_symbol_start(char x)
 {
-    return isalpha(x) || x == '_';
+    return isalpha((unsigned char) x) || x == '_' || (unsigned char) x >= 0x80;
 }
 
 bool is_symbol(char x)
 {
-    return isalnum(x) || x == '_';
+    return isalnum((unsigned char) x) || x == '_' || (unsigned char) x >= 0x80;
 }
 
 Token lexer_next(Lexer *l)

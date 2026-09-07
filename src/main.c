@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include <SDL2/SDL.h>
 #define GLEW_STATIC
@@ -35,6 +37,23 @@ void MessageCallback(GLenum source,
 int main(int argc, char **argv)
 {
     app_register_commands();
+
+    // Fail before any window/GL resources exist - app_run's own file
+    // checks now run after SDL/GL/renderer init.
+    if (argc > 1) {
+        struct stat st;
+        if (stat(argv[1], &st) != 0) {
+            fprintf(stderr, "ERROR: Could not read file %s: %s\n", argv[1], strerror(errno));
+            return 1;
+        }
+    }
+    {
+        struct stat st;
+        if (stat(".", &st) != 0) {
+            fprintf(stderr, "ERROR: Could not read directory .: %s\n", strerror(errno));
+            return 1;
+        }
+    }
 
     Config cfg = config_default();
     Errno err = config_load("./dede.conf", &cfg);

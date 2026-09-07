@@ -230,18 +230,21 @@ void editor_backspace(Editor *e)
         if (e->cursor > e->data.count) {
             e->cursor = e->data.count;
         }
-        if (e->cursor == 0) return;
 
         if (e->selection) {
             editor_delete_selection(e);
             return;
         }
 
-        size_t pos = e->cursor - 1;
-        char c = e->data.items[pos];
+        if (e->cursor == 0) return;
+
+        size_t pos = editor_find_char_left(e, e->cursor);
+        size_t len = e->cursor - pos;
+        char text[4];
+        memcpy(text, &e->data.items[pos], len);
         e->cursor = pos;
-        editor_data_remove(e, pos, 1);
-        editor_add_op(e, EDIT_DELETE, pos, &c, 1);
+        editor_data_remove(e, pos, len);
+        editor_add_op(e, EDIT_DELETE, pos, text, len);
         editor_retokenize(e);
     }
 }
@@ -256,9 +259,12 @@ void editor_delete(Editor *e)
     }
 
     if (e->cursor >= e->data.count) return;
-    char c = e->data.items[e->cursor];
-    editor_data_remove(e, e->cursor, 1);
-    editor_add_op(e, EDIT_DELETE, e->cursor, &c, 1);
+    size_t end = editor_find_char_right(e, e->cursor);
+    size_t len = end - e->cursor;
+    char text[4];
+    memcpy(text, &e->data.items[e->cursor], len);
+    editor_data_remove(e, e->cursor, len);
+    editor_add_op(e, EDIT_DELETE, e->cursor, text, len);
     editor_retokenize(e);
 }
 
@@ -376,42 +382,64 @@ size_t editor_find_line_down(const Editor *e, size_t pos)
     return next_line.begin + col;
 }
 
+// A UTF-8 sequence is at most 4 bytes; capping the continuation-byte skip
+// at 3 keeps a single "character" step bounded even against malformed
+// input (a long run of stray continuation bytes), which matters since
+// callers like editor_backspace/editor_delete size a fixed buffer off it.
 size_t editor_find_char_left(const Editor *e, size_t pos)
 {
-    (void) e;
-    return pos > 0 ? pos - 1 : pos;
+    if (pos == 0) return pos;
+    pos -= 1;
+    for (int i = 0; i < 3 && pos > 0 && utf8_is_continuation((unsigned char) e->data.items[pos]); ++i) {
+        pos -= 1;
+    }
+    return pos;
 }
 
 size_t editor_find_char_right(const Editor *e, size_t pos)
 {
-    return pos < e->data.count ? pos + 1 : pos;
+    if (pos >= e->data.count) return pos;
+    pos += 1;
+    for (int i = 0; i < 3 && pos < e->data.count && utf8_is_continuation((unsigned char) e->data.items[pos]); ++i) {
+        pos += 1;
+    }
+    return pos;
+}
+
+// Word-motion classification: an ASCII byte is a word byte iff alnum
+// (unchanged from before); any byte >=0x80 is part of a multi-byte UTF-8
+// character and is unconditionally treated as a word byte too - no
+// attempt at per-script classification, just "non-ASCII text is word-like".
+static bool editor_is_word_byte(unsigned char b)
+{
+    return b >= 0x80 || isalnum(b);
 }
 
 size_t editor_find_word_left(const Editor *e, size_t pos)
 {
-    while (pos > 0 && !isalnum((unsigned char) e->data.items[pos - 1])) {
-        pos -= 1;
+    while (pos > 0 && !editor_is_word_byte((unsigned char) e->data.items[pos - 1])) {
+        pos = editor_find_char_left(e, pos);
     }
-    while (pos > 0 && isalnum((unsigned char) e->data.items[pos - 1])) {
-        pos -= 1;
+    while (pos > 0 && editor_is_word_byte((unsigned char) e->data.items[pos - 1])) {
+        pos = editor_find_char_left(e, pos);
     }
     return pos;
 }
 
 size_t editor_find_word_right(const Editor *e, size_t pos)
 {
-    while (pos < e->data.count && !isalnum((unsigned char) e->data.items[pos])) {
-        pos += 1;
+    while (pos < e->data.count && !editor_is_word_byte((unsigned char) e->data.items[pos])) {
+        pos = editor_find_char_right(e, pos);
     }
-    while (pos < e->data.count && isalnum((unsigned char) e->data.items[pos])) {
-        pos += 1;
+    while (pos < e->data.count && editor_is_word_byte((unsigned char) e->data.items[pos])) {
+        pos = editor_find_char_right(e, pos);
     }
     return pos;
 }
 
 // Vim's `e`: land ON the last character of the current/next word, as
 // opposed to `w`'s "start of the next word". Uses the same word
-// definition as word_left/word_right (maximal alnum run; everything
+// definition as word_left/word_right (maximal word-byte run; everything
 // else is a separator) - this codebase does not distinguish punctuation
 // runs from word runs the way real Vim does, so `e` is an approximation
 // consistent with the rest of the file, not a full Vim word model.
@@ -420,18 +448,22 @@ size_t editor_find_word_end(const Editor *e, size_t pos)
     size_t count = e->data.count;
     if (count == 0) return pos;
 
-    // Always step forward at least once so repeated `e` presses advance
-    // instead of getting stuck once the cursor already sits on a word end.
-    if (pos + 1 >= count) return pos;
-    pos += 1;
+    // Always step forward at least one character so repeated `e` presses
+    // advance instead of getting stuck once the cursor already sits on a
+    // word end.
+    size_t next = editor_find_char_right(e, pos);
+    if (next >= count) return pos;
+    pos = next;
 
-    while (pos < count && !isalnum((unsigned char) e->data.items[pos])) {
-        pos += 1;
+    while (pos < count && !editor_is_word_byte((unsigned char) e->data.items[pos])) {
+        pos = editor_find_char_right(e, pos);
     }
     if (pos >= count) return count - 1;
 
-    while (pos + 1 < count && isalnum((unsigned char) e->data.items[pos + 1])) {
-        pos += 1;
+    for (;;) {
+        next = editor_find_char_right(e, pos);
+        if (next >= count || !editor_is_word_byte((unsigned char) e->data.items[next])) break;
+        pos = next;
     }
     return pos;
 }
@@ -549,18 +581,6 @@ void editor_insert_buf(Editor *e, char *buf, size_t buf_len)
     }
 }
 
-static size_t editor_row_of(const Editor *e, size_t pos)
-{
-    assert(e->lines.count > 0);
-    for (size_t row = 0; row < e->lines.count; ++row) {
-        Line line = e->lines.items[row];
-        if (line.begin <= pos && pos <= line.end) {
-            return row;
-        }
-    }
-    return e->lines.count - 1;
-}
-
 // Maps a pre-edit position to its position after every selected row `row_begin..row_end`
 // gained `deltas[r]` bytes (negative when bytes were removed). Works only while
 // `e->lines` still reflects the pre-edit layout.
@@ -609,13 +629,14 @@ void editor_indent(Editor *e)
         return;
     }
 
-    size_t row_begin = editor_row_of(e, begin);
-    size_t row_end = editor_row_of(e, end);
+    size_t row_begin = editor_row_at(e, begin);
+    size_t row_end = editor_row_at(e, end);
     if (row_end > row_begin && e->lines.items[row_end].begin == end) {
         row_end -= 1; // the selection ends exactly where a line starts
     }
 
     ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+    if (deltas == NULL) return; // out of memory: leave the selection untouched rather than crash
 
     // Insert bottom-up so the shorter (upper) lines keep valid positions.
     for (size_t r = row_end + 1; r > row_begin; --r) {
@@ -641,7 +662,7 @@ void editor_unindent(Editor *e)
     size_t width = editor_clamped_indent_width(e);
 
     if (!e->selection) {
-        size_t row = editor_row_of(e, e->cursor);
+        size_t row = editor_row_at(e, e->cursor);
         size_t at = e->lines.items[row].begin;
         size_t end = e->lines.items[row].end;
 
@@ -675,13 +696,14 @@ void editor_unindent(Editor *e)
         return;
     }
 
-    size_t row_begin = editor_row_of(e, begin);
-    size_t row_end = editor_row_of(e, end);
+    size_t row_begin = editor_row_at(e, begin);
+    size_t row_end = editor_row_at(e, end);
     if (row_end > row_begin && e->lines.items[row_end].begin == end) {
         row_end -= 1;
     }
 
     ptrdiff_t *deltas = calloc(e->lines.count, sizeof(*deltas));
+    if (deltas == NULL) return; // out of memory: leave the selection untouched rather than crash
 
     // Remove bottom-up so the shorter (upper) lines keep valid positions.
     char spaces[EDITOR_MAX_INDENT_WIDTH] = {0};
@@ -777,6 +799,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
     SDL_GetWindowSize(window, &w, &h);
 
     float max_line_len = 0.0f;
+    float gutter_reserved_px = 0.0f; // set below if editor->line_numbers; narrows the cursor-follow viewport so the gutter never covers the cursor
 
     sr->resolution = vec2f(w, h);
     sr->time = (float) SDL_GetTicks() / 1000.0f;
@@ -886,15 +909,14 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
             // Normal-mode block cursor: fill the actual glyph cell under
             // the cursor (its real advance width), not just a thicker bar.
             // Falls back to the space glyph's width past end-of-buffer/line
-            // or for control characters like '\n', which aren't in the
-            // printable-ASCII metrics table.
-            unsigned char ch = ' ';
+            // or for control characters like '\n'.
+            uint32_t cp = ' ';
             if (editor->cursor < editor->data.count) {
-                ch = (unsigned char) editor->data.items[editor->cursor];
+                utf8_decode(editor->data.items + editor->cursor, editor->data.count - editor->cursor, &cp);
             }
-            if (ch < 32 || ch >= GLYPH_METRICS_CAPACITY) ch = ' ';
-            CURSOR_WIDTH = atlas->metrics[ch].ax;
-            if (CURSOR_WIDTH <= 0.0f) CURSOR_WIDTH = atlas->metrics[(unsigned char) ' '].ax;
+            if (cp < 32) cp = ' ';
+            CURSOR_WIDTH = free_glyph_atlas_glyph(atlas, cp).ax;
+            if (CURSOR_WIDTH <= 0.0f) CURSOR_WIDTH = free_glyph_atlas_glyph(atlas, ' ').ax;
         }
         Uint32 CURSOR_BLINK_THRESHOLD = 500;
         Uint32 CURSOR_BLINK_PERIOD = 1000;
@@ -911,13 +933,68 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         simple_renderer_flush(sr);
     }
 
+    // Render line-number gutter. Pinned to the viewport's left edge in
+    // screen space (recomputed from the live camera each frame, per the
+    // camera_project formula in simple.vert: screen = 2*(world -
+    // camera_pos)*scale/resolution) rather than a fixed world X, so it
+    // doesn't pan away with the document on a long, horizontally-
+    // scrolled line - but it shares the document's own camera_scale, so
+    // row spacing stays aligned with the text at any zoom level. Drawn
+    // last so its background occludes whatever text has scrolled
+    // beneath it.
+    if (editor->line_numbers) {
+        size_t last_line = editor->lines.count;
+        int digits = 1;
+        for (size_t n = last_line; n >= 10; n /= 10) digits += 1;
+
+        float digit_w = free_glyph_atlas_glyph(atlas, '0').ax;
+        float pad = digit_w;
+        float gutter_w = digit_w * (float) digits + pad * 2.0f;
+
+        float MARGIN_PX = 4.0f;
+        float screen_left_x = sr->camera_pos.x - sr->resolution.x / (2.0f * sr->camera_scale);
+        float gutter_x = screen_left_x + MARGIN_PX / sr->camera_scale;
+        size_t cursor_row = editor_cursor_row(editor);
+
+        simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
+        for (size_t row = 0; row < editor->lines.count; ++row) {
+            Vec2f bg_pos = vec2f(screen_left_x, -((float) row + CURSOR_OFFSET) * FREE_GLYPH_FONT_SIZE);
+            simple_renderer_solid_rect(sr, bg_pos, vec2f(gutter_x + gutter_w - screen_left_x, FREE_GLYPH_FONT_SIZE), vec4f(.13f, .13f, .13f, 1.0f));
+        }
+        simple_renderer_flush(sr);
+
+        simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
+        for (size_t row = 0; row < editor->lines.count; ++row) {
+            size_t number = (editor->relative_line_numbers && row != cursor_row)
+                ? (row > cursor_row ? row - cursor_row : cursor_row - row)
+                : row + 1;
+
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%zu", number);
+
+            Vec2f measure = vec2fs(0.0f);
+            free_glyph_atlas_measure_line_sized(atlas, buf, (size_t) len, &measure);
+
+            Vec2f text_pos = vec2f(gutter_x + gutter_w - pad - measure.x, -(float) row * FREE_GLYPH_FONT_SIZE);
+            free_glyph_atlas_render_line_sized(atlas, sr, buf, (size_t) len, &text_pos, vec4f(.5f, .5f, .5f, 1.0f));
+        }
+        simple_renderer_flush(sr);
+
+        gutter_reserved_px = MARGIN_PX + gutter_w * sr->camera_scale;
+    }
+
     // Update camera
     {
         if (max_line_len > 1000.0f) {
             max_line_len = 1000.0f;
         }
 
-        float target_scale = w/3/(max_line_len*0.75); // TODO: division by 0
+        // Usable width excludes the gutter's reserved strip, so the
+        // cursor-follow math below never settles the cursor underneath it.
+        float usable_w = (float) w - gutter_reserved_px;
+        if (usable_w < 1.0f) usable_w = 1.0f;
+
+        float target_scale = usable_w/3/(max_line_len*0.75); // TODO: division by 0
 
         Vec2f target = cursor_pos;
         float offset = 0.0f;
@@ -925,9 +1002,9 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         if (target_scale > 3.0f) {
             target_scale = 3.0f;
         } else {
-            offset = cursor_pos.x - w/3/sr->camera_scale;
+            offset = cursor_pos.x - usable_w/3/sr->camera_scale;
             if (offset < 0.0f) offset = 0.0f;
-            target = vec2f(w/3/sr->camera_scale + offset, cursor_pos.y);
+            target = vec2f(usable_w/3/sr->camera_scale + offset, cursor_pos.y);
         }
 
         sr->camera_vel = vec2f_mul(

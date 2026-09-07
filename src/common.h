@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "./la.h"
 
 #define SCREEN_WIDTH 800
@@ -110,5 +111,10 @@ Errno write_entire_file(const char *file_path, const char *buf, size_t buf_size)
 Errno read_entire_dir(const char *dir_path, Files *files);
 
 Vec4f hex_to_vec4f(uint32_t color);
+
+// Byte-level UTF-8 helpers - the rest of the codebase treats e->data etc.
+// as flat byte buffers; these are what let it also treat them as text.
+bool utf8_is_continuation(unsigned char b);
+size_t utf8_decode(const char *s, size_t n, uint32_t *out_cp);
 
 #endif // COMMON_H_

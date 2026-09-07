@@ -1,6 +1,6 @@
 # dede
 
-**dede** ("Dramatically Expanded Dramatic Editor") is a personal, actively-expanded fork of [`ded`](https://github.com/tsoding/ded) ("Dramatic EDitor", by Alexey Kutepov / tsoding) — a GPU-rendered text editor in C11. This fork is maintained by and primarily for its own author, as a daily-driver editor built up incrementally rather than a polished general-purpose release. Expect rough edges.
+**dede** ("**D**ramatically **E**xpanded **D**ramatic **E**ditor") is a personal, actively-expanded fork of [`ded`](https://github.com/tsoding/ded) ("**D**ramatic **ED**itor", by Alexey Kutepov / tsoding) — a GPU-rendered text editor in C11. This fork is maintained by and primarily for its own author, as a daily-driver editor built up incrementally rather than a polished general-purpose release. Expect rough edges.
 
 ## Features
 

@@ -116,6 +116,56 @@ defer:
     return result;
 }
 
+bool utf8_is_continuation(unsigned char b)
+{
+    return (b & 0xC0) == 0x80;
+}
+
+// Decodes the codepoint starting at s[0] (up to n bytes available),
+// returning bytes consumed (1-4). Falls back to treating s[0] as a raw
+// byte value and consuming 1 byte on any invalid or truncated sequence -
+// never over-reads, never returns 0.
+size_t utf8_decode(const char *s, size_t n, uint32_t *out_cp)
+{
+    unsigned char b0 = (unsigned char) s[0];
+
+    size_t len;
+    uint32_t cp;
+    if (b0 < 0x80) {
+        *out_cp = b0;
+        return 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+        len = 2;
+        cp = b0 & 0x1F;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        len = 3;
+        cp = b0 & 0x0F;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        len = 4;
+        cp = b0 & 0x07;
+    } else {
+        *out_cp = b0;
+        return 1;
+    }
+
+    if (len > n) {
+        *out_cp = b0;
+        return 1;
+    }
+
+    for (size_t i = 1; i < len; ++i) {
+        unsigned char bi = (unsigned char) s[i];
+        if (!utf8_is_continuation(bi)) {
+            *out_cp = b0;
+            return 1;
+        }
+        cp = (cp << 6) | (bi & 0x3F);
+    }
+
+    *out_cp = cp;
+    return len;
+}
+
 Vec4f hex_to_vec4f(uint32_t color)
 {
     Vec4f result;

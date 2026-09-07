@@ -10,8 +10,8 @@ typedef struct {
     char font_path[CONFIG_FONT_PATH_CAP];
     size_t tab_width;
     bool vim_mode;              // Vim keybindings on/off, everywhere (editor + file browser)
-    bool line_numbers;          // stored for now; rendering is a follow-up
-    bool relative_line_numbers; // stored for now; rendering is a follow-up
+    bool line_numbers;          // show the gutter
+    bool relative_line_numbers; // gutter shows distance-from-cursor instead of absolute numbers, except on the cursor's own line
 } Config;
 
 // Built-in defaults - what the editor uses with no config file, or for

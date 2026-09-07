@@ -366,6 +366,121 @@ int main(void)
                (int) o.data.count, o.data.items);
     }
 
+    printf("\n--- utf-8 ---\n");
+
+    // utf8_decode / utf8_is_continuation: ASCII passthrough, valid
+    // 2/3/4-byte sequences, and graceful fallback on truncated/invalid ones.
+    {
+        uint32_t cp;
+        size_t n;
+
+        n = utf8_decode("A", 1, &cp);
+        CHECK_EQ("utf8_decode: ASCII byte consumes 1", n, 1);
+        CHECK_EQ("utf8_decode: ASCII byte decodes to itself", cp, 'A');
+
+        n = utf8_decode("\xC3\xA9", 2, &cp); // U+00E9 'e' with acute accent
+        CHECK_EQ("utf8_decode: 2-byte sequence consumes 2", n, 2);
+        CHECK_EQ("utf8_decode: 2-byte sequence decodes correctly", cp, 0xE9);
+
+        n = utf8_decode("\xE2\x82\xAC", 3, &cp); // U+20AC euro sign
+        CHECK_EQ("utf8_decode: 3-byte sequence consumes 3", n, 3);
+        CHECK_EQ("utf8_decode: 3-byte sequence decodes correctly", cp, 0x20AC);
+
+        n = utf8_decode("\xF0\x9F\x98\x80", 4, &cp); // U+1F600 grinning face
+        CHECK_EQ("utf8_decode: 4-byte sequence consumes 4", n, 4);
+        CHECK_EQ("utf8_decode: 4-byte sequence decodes correctly", cp, 0x1F600);
+
+        n = utf8_decode("\xC3", 1, &cp); // truncated: lead byte, no continuation available
+        CHECK_EQ("utf8_decode: truncated sequence falls back to 1 byte", n, 1);
+        CHECK_EQ("utf8_decode: truncated sequence's fallback codepoint is the raw byte", cp, 0xC3);
+
+        n = utf8_decode("\xC3X", 2, &cp); // invalid: lead byte followed by non-continuation
+        CHECK_EQ("utf8_decode: invalid continuation falls back to 1 byte", n, 1);
+
+        if (!utf8_is_continuation(0x80) || !utf8_is_continuation(0xBF)) {
+            printf("FAIL: utf8_is_continuation should be true for 0x80 and 0xBF\n");
+            failures++;
+        } else {
+            printf("ok:   utf8_is_continuation is true for the 0x80-0xBF range\n");
+        }
+        if (utf8_is_continuation('A') || utf8_is_continuation(0xC3)) {
+            printf("FAIL: utf8_is_continuation should be false for ASCII and lead bytes\n");
+            failures++;
+        } else {
+            printf("ok:   utf8_is_continuation is false for ASCII and lead bytes\n");
+        }
+    }
+
+    // "café" = c,a,f,0xC3,0xA9 - a 4-character word stored in 5 bytes.
+    // char motions must treat the last two bytes as one character.
+    {
+        Editor u = {0};
+        sb_append_buf(&u.data, "caf\xC3\xA9", 5);
+        build_lines(&u);
+
+        CHECK_EQ("char_right before the accented char skips both its bytes", editor_find_char_right(&u, 3), 5);
+        CHECK_EQ("char_left after the accented char lands before both its bytes", editor_find_char_left(&u, 5), 3);
+        CHECK_EQ("char_left from mid-sequence (byte 4) still lands on the char start", editor_find_char_left(&u, 4), 3);
+    }
+
+    // word_right must treat the whole accented word as one word, not stop
+    // partway through it at the multi-byte character.
+    {
+        Editor u = {0};
+        sb_append_buf(&u.data, "caf\xC3\xA9 test", 10);
+        build_lines(&u);
+
+        CHECK_EQ("word_right treats an accented word as one word", editor_find_word_right(&u, 0), 5);
+        CHECK_EQ("word_left back over an accented word reaches its start", editor_find_word_left(&u, 5), 0);
+    }
+
+    // Backspace/Delete must remove a whole multi-byte character in one
+    // call, not leave a stray continuation byte behind.
+    {
+        Editor u = {0};
+        sb_append_buf(&u.data, "caf\xC3\xA9", 5);
+        build_lines(&u);
+        u.cursor = 5;
+        editor_backspace(&u);
+        CHECK_STR("backspace after an accented char removes the whole character", u.data.items, u.data.count, "caf");
+        CHECK_EQ("backspace leaves the cursor before the removed character", u.cursor, 3);
+    }
+    {
+        Editor u = {0};
+        sb_append_buf(&u.data, "caf\xC3\xA9", 5);
+        build_lines(&u);
+        u.cursor = 3;
+        editor_delete(&u);
+        CHECK_STR("delete on an accented char removes the whole character", u.data.items, u.data.count, "caf");
+    }
+
+    // Plain ASCII backspace/delete must still remove exactly one byte
+    // (regression guard - the multi-byte fix must not widen this).
+    {
+        Editor u = {0};
+        sb_append_buf(&u.data, "abc", 3);
+        build_lines(&u);
+        u.cursor = 3;
+        editor_backspace(&u);
+        CHECK_STR("backspace on plain ASCII still removes exactly one char", u.data.items, u.data.count, "ab");
+    }
+
+    // Lexer: a non-ASCII identifier must lex as one TOKEN_SYMBOL, not
+    // fragment into per-byte TOKEN_INVALID tokens (is_symbol/is_symbol_start
+    // now accept any byte >=0x80 as an identifier character).
+    {
+        const char *src = "caf\xC3\xA9_test = 1;";
+        Lexer l = lexer_new(NULL, src, strlen(src));
+        Token t = lexer_next(&l);
+        if (t.kind != TOKEN_SYMBOL || t.text_len != 10) {
+            printf("FAIL: non-ASCII identifier should lex as one 10-byte TOKEN_SYMBOL, got kind=%s len=%zu\n",
+                   token_kind_name(t.kind), t.text_len);
+            failures++;
+        } else {
+            printf("ok:   non-ASCII identifier lexes as one TOKEN_SYMBOL -> len %zu\n", t.text_len);
+        }
+    }
+
     printf("\n--- vim counts ---\n");
 
     RESET_OP_TEST("hello world");
@@ -425,6 +540,71 @@ int main(void)
     vim_handle_key(&ov, &o, KEY(SDLK_g));
     vim_handle_key(&ov, &o, KEY(SDLK_g));
     CHECK_EQ("'3gg' jumps to line 3", o.cursor, 8);
+
+    // dj/dk/dgg/dG: linewise motions composed with an operator
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'dj' deletes the current and next line", o.data.items, o.data.count, "one\nfour");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 9; // inside "three"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_k));
+    CHECK_STR("'dk' deletes the previous and current line", o.data.items, o.data.count, "one\nfour");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 0;
+    vim_handle_key(&ov, &o, KEY(SDLK_2));
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'2dj' deletes 3 lines (current + 2 down)", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 9; // inside "three"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    CHECK_STR("'dgg' deletes from the current line to the buffer's start", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY_SHIFT(SDLK_g));
+    CHECK_STR("'dG' deletes from the current line to the buffer's end", o.data.items, o.data.count, "one");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 0; // "one"
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_3));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    CHECK_STR("'d3gg' deletes lines 1 through 3", o.data.items, o.data.count, "four\nfive");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour\nfive");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_c));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'cj' merges the current and next line's content into one empty line", o.data.items, o.data.count, "one\n\nfour\nfive");
+    if (ov.mode != VIM_MODE_INSERT) { printf("FAIL: 'cj' should enter Insert mode\n"); failures++; }
+    else printf("ok:   'cj' enters Insert mode\n");
+
+    RESET_OP_TEST("one\ntwo\nthree\nfour");
+    o.cursor = 4; // inside "two"
+    vim_handle_key(&ov, &o, KEY(SDLK_y));
+    vim_handle_key(&ov, &o, KEY(SDLK_j));
+    CHECK_STR("'yj' does not modify the buffer", o.data.items, o.data.count, "one\ntwo\nthree\nfour");
+    CHECK_EQ("'yj' moves cursor to the start of the yanked range", o.cursor, 4);
+
+    // an unrecognized key after "d g" cancels the pending delete, same as any other operator+garbage
+    RESET_OP_TEST("one\ntwo");
+    vim_handle_key(&ov, &o, KEY(SDLK_d));
+    vim_handle_key(&ov, &o, KEY(SDLK_g));
+    vim_handle_key(&ov, &o, KEY(SDLK_x));
+    CHECK_STR("'d' then 'g' then 'x' (not 'gg') cancels the pending delete", o.data.items, o.data.count, "one\ntwo");
+    if (ov.pending_op != VIM_OP_NONE) { printf("FAIL: pending_op should be cleared after cancelling a broken 'gg'\n"); failures++; }
+    else printf("ok:   pending_op cleared after cancelling a broken 'gg'\n");
 
     printf("\n--- vim visual mode ---\n");
 

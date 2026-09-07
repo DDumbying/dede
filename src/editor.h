@@ -108,8 +108,8 @@ typedef struct {
     // Config (see config.h). Clamped to EDITOR_MAX_INDENT_WIDTH.
     size_t indent_width;
 
-    // User settings from Config, set once at startup. Not read by
-    // editor_render yet - the gutter itself is a follow-up.
+    // User settings from Config, set once at startup. See editor_render's
+    // gutter-drawing block for how these two combine.
     bool line_numbers;
     bool relative_line_numbers;
 } Editor;
