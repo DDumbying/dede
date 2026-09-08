@@ -79,6 +79,13 @@ static size_t splash_cursor = 0;
 // that trailing text belongs to the mode we left and must never be typed.
 static bool app_mode_changed_this_key = false;
 
+// Same idea as app_mode_changed_this_key, but for the file browser's
+// filter turning on within APP_MODE_FILE_BROWSER itself (mode doesn't
+// change, so that flag doesn't fire): true for one SDL_TEXTINPUT right
+// after the SDL_KEYDOWN that started fb.searching, so the ':' that
+// triggered it doesn't also become the filter's first character.
+static bool fb_search_started_this_key = false;
+
 #define SAVE_AS_PATH_CAP 1024
 static char save_as_path[SAVE_AS_PATH_CAP] = {0};
 static size_t save_as_path_len = 0;
@@ -335,8 +342,8 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
 
     float bar_h = UI_BAR_HEIGHT_PX / UI_TEXT_SCALE;
     float pad = UI_TEXT_PADDING_PX / UI_TEXT_SCALE;
-    Vec4f fg = vec4fs(1.0f);
-    Vec4f bg = hex_to_vec4f(0x252525FF);
+    Vec4f fg = hex_to_vec4f(editor.theme.fg);
+    Vec4f bg = hex_to_vec4f(editor.theme.ui_bar_bg);
 
     char left[SAVE_AS_PATH_CAP + 32];
     const char *right = NULL;
@@ -345,17 +352,34 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
     Vec2f right_measure = vec2fs(0.0f);
 
     if (mode == APP_MODE_CONFIRM) {
-        bg = hex_to_vec4f(0x4A1D1DFF);
+        bg = hex_to_vec4f(editor.theme.ui_bar_error_bg);
         snprintf(left, sizeof(left), "%s", confirm_message(pending_action));
     } else if (mode == APP_MODE_SAVE_AS) {
-        bg = hex_to_vec4f(0x1D2E4AFF);
+        bg = hex_to_vec4f(editor.theme.ui_bar_prompt_bg);
         snprintf(left, sizeof(left), "Save as: %s_", save_as_path);
     } else if (mode == APP_MODE_COMMAND) {
-        bg = hex_to_vec4f(0x1D2E4AFF);
+        bg = hex_to_vec4f(editor.theme.ui_bar_prompt_bg);
         snprintf(left, sizeof(left), ":%s_", command_line);
+    } else if (editor.replacing) {
+        bg = hex_to_vec4f(editor.theme.ui_bar_prompt_bg);
+        snprintf(left, sizeof(left), "Replace \"%.*s\" with: %.*s_  (Enter: next, Ctrl+Enter: all, Esc: cancel)",
+                 (int) editor.search.count, editor.search.items,
+                 (int) editor.replace.count, editor.replace.items);
     } else if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
-        bg = hex_to_vec4f(0x4A1D1DFF);
+        bg = hex_to_vec4f(editor.theme.ui_bar_error_bg);
         snprintf(left, sizeof(left), "%s", error_message);
+    } else if (mode == APP_MODE_FILE_BROWSER) {
+        if (fb.searching) {
+            bg = hex_to_vec4f(editor.theme.ui_bar_prompt_bg);
+            snprintf(left, sizeof(left), "Filter: %.*s_", (int) fb.search.count, fb.search.items);
+        } else {
+            const char *dir = fb.dir_path.count > 0 ? fb.dir_path.items : "";
+            if (vim_enabled) {
+                snprintf(left, sizeof(left), "%s  (: to filter)", dir);
+            } else {
+                snprintf(left, sizeof(left), "%s", dir);
+            }
+        }
     } else {
         size_t row = editor_cursor_row(&editor);
         Line line = editor.lines.items[row];
@@ -406,12 +430,23 @@ static void draw_status_bar(Simple_Renderer *sr, Free_Glyph_Atlas *atlas)
 // World-space height `draw_logo` will use for `size_px`, without
 // actually drawing anything - lets a caller lay out its whole screen
 // (to vertically center it) before it starts drawing top-down.
+static float logo_world_size(float size_px, float *out_w, float *out_h)
+{
+    if (logo_image.texture == 0) {
+        *out_w = 0.0f;
+        *out_h = 0.0f;
+        return 0.0f;
+    }
+    float aspect = logo_image.height > 0 ? (float) logo_image.width / (float) logo_image.height : 1.0f;
+    *out_w = size_px / SPLASH_TEXT_SCALE;
+    *out_h = *out_w / aspect;
+    return *out_h;
+}
+
 static float logo_world_height(float size_px)
 {
-    if (logo_image.texture == 0) return 0.0f;
-    float aspect = logo_image.height > 0 ? (float) logo_image.width / (float) logo_image.height : 1.0f;
-    float w = size_px / SPLASH_TEXT_SCALE;
-    return w / aspect;
+    float w, h;
+    return logo_world_size(size_px, &w, &h);
 }
 
 // Draws the logo (a no-op if it failed to load at startup) centered
@@ -422,10 +457,8 @@ static float logo_world_height(float size_px)
 static float draw_logo(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, float top_y, float size_px)
 {
     if (logo_image.texture == 0) return 0.0f;
-
-    float aspect = logo_image.height > 0 ? (float) logo_image.width / (float) logo_image.height : 1.0f;
-    float w = size_px / SPLASH_TEXT_SCALE;
-    float h = w / aspect;
+    float w, h;
+    logo_world_size(size_px, &w, &h);
 
     glBindTexture(GL_TEXTURE_2D, logo_image.texture);
     simple_renderer_set_shader(sr, SHADER_FOR_IMAGE);
@@ -445,7 +478,7 @@ static void draw_divider(Simple_Renderer *sr, float y, float width_px)
     float thickness = 1.0f / SPLASH_TEXT_SCALE;
     simple_renderer_flush(sr);
     simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
-    simple_renderer_solid_rect(sr, vec2f(-w / 2.0f, y), vec2f(w, thickness), hex_to_vec4f(0x2A2A2AFF));
+    simple_renderer_solid_rect(sr, vec2f(-w / 2.0f, y), vec2f(w, thickness), hex_to_vec4f(editor.theme.divider));
     simple_renderer_flush(sr);
     simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
 }
@@ -480,11 +513,11 @@ static void draw_splash_row(Simple_Renderer *sr, Free_Glyph_Atlas *atlas, const 
             sr,
             vec2f(-measure.x / 2.0f - pad / 2.0f, y - (float) FREE_GLYPH_FONT_SIZE * 0.25f),
             vec2f(measure.x + pad, (float) FREE_GLYPH_FONT_SIZE * 1.1f),
-            hex_to_vec4f(0x2A2A2AFF));
+            hex_to_vec4f(editor.theme.divider));
         simple_renderer_flush(sr);
         simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
     }
-    draw_centered_line(sr, atlas, text, y, selected ? hex_to_vec4f(0xFFDD33FF) : vec4fs(0.75f));
+    draw_centered_line(sr, atlas, text, y, selected ? hex_to_vec4f(editor.theme.accent) : vec4fs(0.75f));
 }
 
 // Startup landing page when dede is launched with no file argument: the
@@ -507,6 +540,7 @@ static void draw_splash_screen(SDL_Window *window, Simple_Renderer *sr, Free_Gly
     float logo_h = logo_world_height(SPLASH_LOGO_SIZE_PX);
     float gap_after_logo = SPLASH_ROW_SPACING * (logo_h > 0.0f ? 1.1f : 0.0f);
     bool has_recent = recent_files_count > 0;
+    bool has_error = error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS;
 
     // Lay the whole screen out top-to-bottom in world units first, so
     // its vertical center (not just its horizontal center) lands on
@@ -516,7 +550,8 @@ static void draw_splash_screen(SDL_Window *window, Simple_Renderer *sr, Free_Gly
     float content_h = logo_h + gap_after_logo
         + (float) SPLASH_MENU_COUNT * SPLASH_ROW_SPACING
         + (has_recent ? SPLASH_ROW_SPACING * (1.6f + (float) recent_files_count) : 0.0f)
-        + SPLASH_ROW_SPACING * 1.4f; // gap + hint line
+        + SPLASH_ROW_SPACING * 1.4f // gap + hint line
+        + (has_error ? SPLASH_ROW_SPACING : 0.0f);
 
     float y = content_h / 2.0f;
     y -= draw_logo(sr, atlas, y, SPLASH_LOGO_SIZE_PX);
@@ -548,9 +583,9 @@ static void draw_splash_screen(SDL_Window *window, Simple_Renderer *sr, Free_Gly
     y -= SPLASH_ROW_SPACING * 0.4f;
     draw_centered_line(sr, atlas, "Up/Down or j/k  -  Enter to select  -  Ctrl+Q to quit", y, vec4fs(0.4f));
 
-    if (error_message[0] != '\0' && SDL_GetTicks() - error_message_time < ERROR_DISPLAY_MS) {
+    if (has_error) {
         y -= SPLASH_ROW_SPACING;
-        draw_centered_line(sr, atlas, error_message, y, hex_to_vec4f(0xFF6B6BFF));
+        draw_centered_line(sr, atlas, error_message, y, hex_to_vec4f(editor.theme.error_text));
     }
 
     simple_renderer_flush(sr);
@@ -814,7 +849,9 @@ static void cmd_redo(void)
 
 static void cmd_confirm_line(void)
 {
-    if (editor.searching) {
+    if (editor.replacing) {
+        editor_replace_current_match(&editor);
+    } else if (editor.searching) {
         editor_flush_group(&editor);
         editor_stop_search(&editor);
     } else {
@@ -827,6 +864,35 @@ static void cmd_start_search(void)
 {
     editor_flush_group(&editor);
     editor_start_search(&editor);
+}
+
+// Ctrl+Shift+F: find-previous - starts a search like Ctrl+F if none is
+// active yet, otherwise jumps to the previous match instead of the next.
+static void cmd_find_prev(void)
+{
+    if (editor.searching) {
+        editor_find_prev_match(&editor);
+    } else {
+        editor_flush_group(&editor);
+        editor_start_search(&editor);
+    }
+}
+
+// Ctrl+H: opens replace-text input alongside an already-active search
+// (see editor_start_replace) - a no-op with nothing typed to search for yet.
+static void cmd_start_replace(void)
+{
+    editor_start_replace(&editor);
+}
+
+// Ctrl+Enter while replacing: replace every match in one pass instead of
+// one at a time. A no-op outside of replace mode.
+static void cmd_replace_all(void)
+{
+    if (!editor.replacing) return;
+    size_t count = editor_replace_all_matches(&editor);
+    editor_stop_replace(&editor);
+    flash_error("Replaced %zu occurrence%s", count, count == 1 ? "" : "s");
 }
 
 // ':' from Vim's Normal mode only - Insert/Visual just type the literal
@@ -866,7 +932,14 @@ static void execute_command_line(const char *cmd)
 static void cmd_escape(void)
 {
     editor_flush_group(&editor);
-    editor_stop_search(&editor);
+    if (editor.replacing) {
+        // One Escape backs out of replace-text input into the still-
+        // active search; a second one (falling to the branch below)
+        // exits the search entirely.
+        editor_stop_replace(&editor);
+    } else {
+        editor_stop_search(&editor);
+    }
 }
 
 static void cmd_select_all(void)
@@ -965,6 +1038,9 @@ static const Command_Def default_commands[] = {
     {"redo",                cmd_redo,                false},
     {"confirm-line",        cmd_confirm_line,        false},
     {"start-search",        cmd_start_search,        false},
+    {"find-prev",           cmd_find_prev,           false},
+    {"start-replace",       cmd_start_replace,       false},
+    {"replace-all",         cmd_replace_all,         false},
     {"start-command-line",  cmd_start_command_line,  false},
     {"select-all",          cmd_select_all,          false},
     {"indent",              cmd_indent,              false},
@@ -1033,6 +1109,9 @@ static const Keybind_Def default_keybindings[] = {
     {"ctrl+y",           "redo"},
     {"return",           "confirm-line"},
     {"ctrl+f",           "start-search"},
+    {"ctrl+shift+f",     "find-prev"},
+    {"ctrl+h",           "start-replace"},
+    {"ctrl+return",      "replace-all"},
     {"shift+;",          "start-command-line"},
     {"ctrl+a",           "select-all"},
     {"tab",              "indent"},
@@ -1065,6 +1144,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
     editor.indent_width = cfg->tab_width;
     editor.line_numbers = cfg->line_numbers;
     editor.relative_line_numbers = cfg->relative_line_numbers;
+    editor.theme = cfg->theme;
     vim_enabled = cfg->vim_mode;
 
     recent_files_load();
@@ -1113,6 +1193,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                         switch (event.key.keysym.sym) {
                         case SDLK_F3: {
                             mode = APP_MODE_EDITOR;
+                            fb_stop_search(&fb);
                         }
                         break;
 
@@ -1122,7 +1203,34 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                         break;
 
                         case SDLK_DOWN: {
-                            if (fb.cursor + 1 < fb.files.count) fb.cursor += 1;
+                            if (fb.cursor + 1 < fb_visible_count(&fb)) fb.cursor += 1;
+                        }
+                        break;
+
+                        case SDLK_BACKSPACE: {
+                            if (fb.searching && fb.search.count > 0) {
+                                fb.search.count -= 1;
+                                fb.cursor = 0;
+                            }
+                        }
+                        break;
+
+                        case SDLK_ESCAPE: {
+                            if (fb.searching) fb_stop_search(&fb);
+                        }
+                        break;
+
+                        // With Vim on, 'j'/'k'/'g' are motions - typing to
+                        // filter has to be an explicit action instead of
+                        // "any character," the same way ':' (not just
+                        // typing) is what starts an Ex command in the
+                        // editor. ':' arrives as ";"+Shift, same chord
+                        // shape as "shift+;" -> start-command-line there.
+                        case SDLK_SEMICOLON: {
+                            if (vim_enabled && (event.key.keysym.mod & KMOD_SHIFT) && !fb.searching) {
+                                fb_start_search(&fb);
+                                fb_search_started_this_key = true;
+                            }
                         }
                         break;
 
@@ -1351,10 +1459,28 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
                     // swallowed no matter which mode we're now in.
                 } else
                 switch (mode) {
-                case APP_MODE_FILE_BROWSER:
-                    // Nothing for now
-                    // Once we have incremental search in the file browser this may become useful
-                    break;
+                case APP_MODE_FILE_BROWSER: {
+                    const char *text = event.text.text;
+                    size_t text_len = strlen(text);
+                    if (fb_search_started_this_key) {
+                        // The ':' keydown that just started fb.searching -
+                        // not filter content itself (see the flag's comment).
+                        fb_search_started_this_key = false;
+                    } else if (fb.searching) {
+                        if (text_len > 0) {
+                            sb_append_buf(&fb.search, text, text_len);
+                            fb.cursor = 0;
+                        }
+                    } else if (!vim_enabled && text_len > 0) {
+                        // No Vim motions competing for letter keys, so any
+                        // printable key can narrow the listing directly -
+                        // with Vim on, 'j'/'k'/'g' need ':' instead (above).
+                        fb_start_search(&fb);
+                        sb_append_buf(&fb.search, text, text_len);
+                        fb.cursor = 0;
+                    }
+                }
+                break;
 
                 case APP_MODE_CONFIRM:
                     // y/n is handled entirely in SDL_KEYDOWN above.
@@ -1415,7 +1541,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
             glViewport(0, 0, w, h);
         }
 
-        Vec4f bg = hex_to_vec4f(0x181818FF);
+        Vec4f bg = hex_to_vec4f(editor.theme.bg);
         glClearColor(bg.x, bg.y, bg.z, bg.w);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -1425,6 +1551,7 @@ int app_run(SDL_Window *window, FT_Face face, Config *cfg, int argc, char **argv
             draw_about_screen(window, &sr, &atlas);
         } else if (mode == APP_MODE_FILE_BROWSER) {
             fb_render(&fb, window, &atlas, &sr);
+            draw_status_bar(&sr, &atlas);
         } else {
             editor_render(window, &atlas, &sr, &editor);
             draw_status_bar(&sr, &atlas);

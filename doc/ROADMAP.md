@@ -5,15 +5,15 @@ What's left, in rough priority order. See [`CHANGELOG.md`](CHANGELOG.md) for wha
 ## Main track
 
 1. ~~**Unsaved-changes prompt**~~ / ~~**Save-as / new-file dialog**~~ — done, see CHANGELOG §2.6.
-2. ~~**Config**~~ / ~~**Line-number gutter rendering**~~ — font path, tab width, keybinding overrides, Vim on/off, and the gutter all done, see CHANGELOG §2.8/§2.10. Theme/color config is the missing piece (below). The gutter is pinned to the viewport's left edge via the live camera transform (so it doesn't pan away on a horizontally-scrolled line) but shares the document's own camera_scale for row alignment; `relative_line_numbers` shows distance-from-cursor except on the cursor's own line.
+2. ~~**Config**~~ / ~~**Line-number gutter rendering**~~ — font path, tab width, keybinding overrides, Vim on/off, theme/color config, and the gutter all done, see CHANGELOG §2.8/§2.10/§2.16. The gutter is pinned to the viewport's left edge via the live camera transform (so it doesn't pan away on a horizontally-scrolled line) but shares the document's own camera_scale for row alignment; `relative_line_numbers` shows distance-from-cursor except on the cursor's own line.
 3. ~~**Status bar**~~ — done: a single permanent bar (`draw_status_bar` in `app.c`), normally showing filename (`.../`-elided path plus a `[+]` dirty marker) on the left and 1-based `Ln, Col` on the right - a confirm/save-as/`:`-command prompt or a flashed error takes the same bar over entirely instead of stacking a second one, since only one is ever relevant at a time. Adjustable horizontal scroll is intentionally not part of this - the editor has no manual scroll control yet, only the automatic cursor-following camera; that'd be its own feature.
-4. **Search improvements** — find next/prev, highlight all matches, replace / replace-all.
-5. **File-browser search** — type to filter the file list (TODO in `src/app.c`).
+4. ~~**Search improvements**~~ — find next/prev, highlight all matches, replace/replace-all, done, see CHANGELOG §2.15.
+5. ~~**File-browser search**~~ — type to filter the file list, done, see CHANGELOG §2.17.
 6. ~~**UTF-8 support**~~ — done at the codepoint level: `common.h`'s `utf8_decode`/`utf8_is_continuation` back cursor motion, word motions, and Backspace/Delete in `editor.c` (all move/remove a whole character, never split mid-sequence); the glyph atlas (`free_glyph.c`) now loads any codepoint on demand into a shelf-packed 2048x2048 texture instead of a fixed 128-entry ASCII table, falling back to `'?'`/the font's own `.notdef` glyph rather than crashing on anything unsupported; the lexer glosses non-ASCII bytes into identifiers instead of fragmenting them. Not attempted: grapheme clusters (combining marks, ZWJ emoji), RTL/bidi, complex script shaping - out of scope for a simple editor, see `src/free_glyph.c`'s and `src/editor.c`'s comments.
 7. **Editing polish** — delete word, replace.
 8. **Multiple buffers / tabs**, split view, project-wide search, git integration.
 9. **Mouse support** — click to place cursor, wheel scroll, drag to select.
-10. **Theme/color config** — background, selection, syntax-highlight, and UI-bar colors are still hardcoded hex literals in `editor.c`/`app.c`; a natural next slice of the config file.
+10. ~~**Theme/color config**~~ — done, see CHANGELOG §2.16.
 11. **Plugin/scripting layer** — deliberately not started: `command_register`/`keymap_bind` (§2.8) are the seam it would attach to (a script registers its own commands and binds keys to them, the same way `app.c`'s own defaults do), and §2.10's `vim_enabled` pattern is the model for making a scripting layer itself optional/toggleable too - but there's no embedded language yet. Lua is the natural choice if/when this is worth doing (small, fast, trivial to vendor, and the proven model for exactly this kind of editor).
 
 ## Vim modal editing track

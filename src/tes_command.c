@@ -88,6 +88,7 @@ int main(void)
     CHECK("config_default enables vim_mode", cfg.vim_mode);
     CHECK("config_default disables line_numbers", !cfg.line_numbers);
     CHECK("config_default disables relative_line_numbers", !cfg.relative_line_numbers);
+    CHECK("config_default's theme.bg matches the old hardcoded editor background", cfg.theme.bg == 0x181818FF);
 
     Errno err = config_load("/nonexistent/path/that/should/not/exist.conf", &cfg);
     CHECK("config_load on a missing file returns success (defaults stand)", err == 0);
@@ -107,6 +108,9 @@ int main(void)
         "bind ctrl+shift+q = test.a\n"
         "tab_width = 999\n"       // out of range - should warn and be ignored
         "not_a_real_setting = 1\n" // unknown key - should warn and be ignored
+        "bg = 282828\n"           // 6-digit hex, implied opaque alpha
+        "accent = #FFDD33ff\n"    // 8-digit hex, "#"-prefixed, mixed case
+        "fg = not-a-color\n"      // invalid - should warn and be ignored
     );
     fclose(f);
 
@@ -119,6 +123,9 @@ int main(void)
     CHECK("config_load applies vim_mode = false", !file_cfg.vim_mode);
     CHECK("config_load applies line_numbers = true", file_cfg.line_numbers);
     CHECK("config_load parses bool values case-insensitively", file_cfg.relative_line_numbers);
+    CHECK("config_load applies a 6-digit hex color with an implied opaque alpha", file_cfg.theme.bg == 0x282828FF);
+    CHECK("config_load applies an 8-digit '#'-prefixed hex color case-insensitively", file_cfg.theme.accent == 0xFFDD33FF);
+    CHECK("config_load rejects a non-hex color, leaving the default in place", file_cfg.theme.fg == config_default().theme.fg);
 
     resolved = keymap_resolve(KEY(SDLK_q, KMOD_LCTRL | KMOD_LSHIFT));
     CHECK("config_load's 'bind' line actually bound the chord", resolved == command_find("test.a"));

@@ -1,6 +1,7 @@
 te
 dede
 SDL2
+dede.conf
 *.exe
 *.obj
 *.pdb

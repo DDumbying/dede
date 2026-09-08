@@ -715,6 +715,12 @@ bool vim_handle_key(Vim_State *vs, Editor *e, SDL_Keysym key)
 
 bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key)
 {
+    // Defer entirely to the file browser's own incremental-filter typing
+    // while it's active - same reason vim_handle_key defers to e->searching
+    // in the main editor: 'j'/'k'/'g' need to reach TEXTINPUT as filter
+    // text, not get claimed here as motions.
+    if (fb->searching) return false;
+
     bool shift = key.mod & KMOD_SHIFT;
     bool ctrl  = key.mod & KMOD_CTRL;
 
@@ -733,11 +739,13 @@ bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key)
 
     size_t count = vs->count ? vs->count : 1;
     switch (key.sym) {
-    case SDLK_j:
+    case SDLK_j: {
+        size_t visible_count = fb_visible_count(fb);
         fb->cursor += count;
-        if (fb->cursor >= fb->files.count) fb->cursor = fb->files.count ? fb->files.count - 1 : 0;
+        if (fb->cursor >= visible_count) fb->cursor = visible_count ? visible_count - 1 : 0;
         vs->count = 0;
         return true;
+    }
 
     case SDLK_k:
         fb->cursor = (count <= fb->cursor) ? fb->cursor - count : 0;
@@ -746,7 +754,8 @@ bool vim_handle_browser_key(Vim_State *vs, File_Browser *fb, SDL_Keysym key)
 
     case SDLK_g:
         if (shift) {
-            fb->cursor = fb->files.count ? fb->files.count - 1 : 0;
+            size_t visible_count = fb_visible_count(fb);
+            fb->cursor = visible_count ? visible_count - 1 : 0;
             vs->count = 0;
         } else {
             vs->pending_g = true;

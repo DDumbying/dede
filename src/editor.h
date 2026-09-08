@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include "common.h"
+#include "config.h"
 #include "free_glyph.h"
 #include "simple_renderer.h"
 #include "lexer.h"
@@ -67,6 +68,12 @@ typedef struct {
     bool searching;
     String_Builder search;
 
+    // Replace-text input, active only while searching (see
+    // editor_start_replace) - piggybacks on the same editor_insert_buf/
+    // editor_backspace redirection e->searching already uses for e->search.
+    bool replacing;
+    String_Builder replace;
+
     bool selection;
     size_t select_begin;
     size_t cursor;
@@ -112,6 +119,10 @@ typedef struct {
     // gutter-drawing block for how these two combine.
     bool line_numbers;
     bool relative_line_numbers;
+
+    // Colors, set once at startup from Config (see config_default's own
+    // comment on where these values come from).
+    Theme theme;
 } Editor;
 
 Errno editor_save_as(Editor *editor, const char *file_path);
@@ -173,5 +184,14 @@ void editor_clipboard_paste(Editor *e);
 void editor_start_search(Editor *e);
 void editor_stop_search(Editor *e);
 bool editor_search_matches_at(Editor *e, size_t pos);
+size_t editor_search_next(Editor *e, size_t from);
+size_t editor_search_prev(Editor *e, size_t from);
+void editor_find_next_match(Editor *e);
+void editor_find_prev_match(Editor *e);
+
+void editor_start_replace(Editor *e);
+void editor_stop_replace(Editor *e);
+bool editor_replace_current_match(Editor *e);
+size_t editor_replace_all_matches(Editor *e);
 
 #endif // EDITOR_H_

@@ -1,3 +1,5 @@
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -7,6 +9,8 @@
 #include "./editor.h"
 #include "./sv.h"
 
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
 Config config_default(void)
 {
     Config cfg = {0};
@@ -15,6 +19,29 @@ Config config_default(void)
     cfg.vim_mode = true;
     cfg.line_numbers = false;
     cfg.relative_line_numbers = false;
+
+    // The theme's built-in defaults are exactly the hex/color literals
+    // this codebase used before theme.<name> config keys existed - so a
+    // config file with no [theme-ish] lines in it renders identically to
+    // before this feature landed.
+    cfg.theme = (Theme) {
+        .bg = 0x181818FF,
+        .fg = 0xFFFFFFFF,
+        .selection = 0x404040FF,
+        .search_current = 0x1A1A40FF,
+        .search_other = 0x1A1A2EFF,
+        .gutter_bg = 0x212121FF,
+        .gutter_fg = 0x808080FF,
+        .accent = 0xFFDD33FF,
+        .comment = 0xCC8C3CFF,
+        .string = 0x73C936FF,
+        .preproc = 0x95A99FFF,
+        .error_text = 0xFF6B6BFF,
+        .ui_bar_bg = 0x252525FF,
+        .ui_bar_prompt_bg = 0x1D2E4AFF,
+        .ui_bar_error_bg = 0x4A1D1DFF,
+        .divider = 0x2A2A2AFF,
+    };
     return cfg;
 }
 
@@ -35,6 +62,80 @@ static bool sv_to_bool(String_View sv, bool *out)
 {
     if (sv_eq_ignorecase(sv, SV("true"))) { *out = true; return true; }
     if (sv_eq_ignorecase(sv, SV("false"))) { *out = false; return true; }
+    return false;
+}
+
+// Parses a "RRGGBB" or "RRGGBBAA" hex color (an optional leading '#' is
+// allowed, to accept colors copied from most color pickers/terminal
+// themes) into hex_to_vec4f's 0xRRGGBBAA encoding. A 6-digit value gets
+// an implied opaque (FF) alpha. Returns false, leaving *out untouched,
+// for anything else - wrong length or non-hex characters.
+static bool sv_to_hex_color(String_View sv, uint32_t *out)
+{
+    if (sv.count > 0 && sv.data[0] == '#') sv_chop_left(&sv, 1);
+    if (sv.count != 6 && sv.count != 8) return false;
+
+    char buf[9];
+    memcpy(buf, sv.data, sv.count);
+    buf[sv.count] = '\0';
+
+    char *end;
+    unsigned long value = strtoul(buf, &end, 16);
+    if (*end != '\0') return false;
+
+    if (sv.count == 6) value = (value << 8) | 0xFF;
+    *out = (uint32_t) value;
+    return true;
+}
+
+// Maps a config key (e.g. "bg") to the matching Theme field's offset
+// within Config, so config_apply_line can handle all sixteen theme
+// colors with one lookup instead of sixteen near-identical else-ifs.
+typedef struct {
+    const char *key;
+    size_t offset;
+} Theme_Field;
+
+#define THEME_FIELD(name) { #name, offsetof(Config, theme.name) }
+static const Theme_Field theme_fields[] = {
+    THEME_FIELD(bg),
+    THEME_FIELD(fg),
+    THEME_FIELD(selection),
+    THEME_FIELD(search_current),
+    THEME_FIELD(search_other),
+    THEME_FIELD(gutter_bg),
+    THEME_FIELD(gutter_fg),
+    THEME_FIELD(accent),
+    THEME_FIELD(comment),
+    THEME_FIELD(string),
+    THEME_FIELD(preproc),
+    THEME_FIELD(error_text),
+    THEME_FIELD(ui_bar_bg),
+    THEME_FIELD(ui_bar_prompt_bg),
+    THEME_FIELD(ui_bar_error_bg),
+    THEME_FIELD(divider),
+};
+
+// Looks up `key` in theme_fields and, if found, parses `value` as a hex
+// color into that field of `*cfg`. Returns false if `key` doesn't name
+// any theme field at all (the caller's cue to report "unknown setting"
+// instead of a parse error) - true either way once a field matched,
+// whether or not `value` itself was valid (a bad color is reported here
+// and skipped, same as every other setting's own parse failure).
+static bool config_apply_theme_line(String_View key, String_View value, size_t line_no, Config *cfg)
+{
+    for (size_t i = 0; i < ARRAY_LEN(theme_fields); ++i) {
+        if (sv_eq_ignorecase(key, sv_from_cstr(theme_fields[i].key))) {
+            uint32_t color;
+            if (sv_to_hex_color(value, &color)) {
+                *(uint32_t *) ((char *) cfg + theme_fields[i].offset) = color;
+            } else {
+                fprintf(stderr, "config:%zu: '%s' must be a 6- or 8-digit hex color (e.g. 282828 or 282828ff), ignoring\n",
+                        line_no, theme_fields[i].key);
+            }
+            return true;
+        }
+    }
     return false;
 }
 
@@ -88,7 +189,7 @@ static void config_apply_line(String_View line, size_t line_no, Config *cfg)
         if (!sv_to_bool(value, &cfg->relative_line_numbers)) {
             fprintf(stderr, "config:%zu: relative_line_numbers must be true or false, ignoring\n", line_no);
         }
-    } else {
+    } else if (!config_apply_theme_line(key, value, line_no, cfg)) {
         fprintf(stderr, "config:%zu: unknown setting '"SV_Fmt"', ignoring\n", line_no, SV_Arg(key));
     }
 }

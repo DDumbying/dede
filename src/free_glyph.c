@@ -10,8 +10,9 @@
 // texture, so with zero gap the edge row/column of one glyph bleeds a
 // sliver of its neighbor's pixels into the rendered quad (visible as
 // thin vertical "tearing" between characters, worse the more the text
-// is magnified). A 1px transparent border on every side is enough for
-// bilinear filtering to blend with transparent black instead.
+// is magnified). A 1px border wasn't enough to fully eliminate the
+// bleeding in practice; 4px gives bilinear filtering enough transparent
+// black to blend with instead.
 #define GLYPH_ATLAS_PADDING 4
 
 void free_glyph_atlas_init(Free_Glyph_Atlas *atlas, FT_Face face)

@@ -222,7 +222,11 @@ static void editor_free_history(Editor *e)
 
 void editor_backspace(Editor *e)
 {
-    if (e->searching) {
+    if (e->replacing) {
+        if (e->replace.count > 0) {
+            e->replace.count -= 1;
+        }
+    } else if (e->searching) {
         if (e->search.count > 0) {
             e->search.count -= 1;
         }
@@ -555,17 +559,16 @@ void editor_insert_char(Editor *e, char x)
 
 void editor_insert_buf(Editor *e, char *buf, size_t buf_len)
 {
-    if (e->searching) {
+    if (e->replacing) {
+        sb_append_buf(&e->replace, buf, buf_len);
+    } else if (e->searching) {
         sb_append_buf(&e->search, buf, buf_len);
-        bool matched = false;
-        for (size_t pos = e->cursor; pos < e->data.count; ++pos) {
-            if (editor_search_matches_at(e, pos)) {
-                e->cursor = pos;
-                matched = true;
-                break;
-            }
+        size_t pos = editor_search_next(e, e->cursor);
+        if (pos != (size_t) -1) {
+            e->cursor = pos;
+        } else {
+            e->search.count -= buf_len;
         }
-        if (!matched) e->search.count -= buf_len;
     } else {
         if (e->cursor > e->data.count) {
             e->cursor = e->data.count;
@@ -836,7 +839,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
                         atlas, editor->data.items + select_begin_chr, select_end_chr - select_begin_chr,
                         &select_end_scr);
 
-                    Vec4f selection_color = vec4f(.25, .25, .25, 1);
+                    Vec4f selection_color = hex_to_vec4f(editor->theme.selection);
                     simple_renderer_solid_rect(sr, select_begin_scr, vec2f(select_end_scr.x - select_begin_scr.x, FREE_GLYPH_FONT_SIZE), selection_color);
                 }
             }
@@ -845,8 +848,8 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
     }
 
     Vec2f cursor_pos = vec2fs(0.0f);
+    size_t cursor_row = editor_cursor_row(editor);
     {
-        size_t cursor_row = editor_cursor_row(editor);
         Line line = editor->lines.items[cursor_row];
         size_t cursor_col = editor->cursor - line.begin;
         cursor_pos.y = -((float)cursor_row + CURSOR_OFFSET) * FREE_GLYPH_FONT_SIZE;
@@ -858,15 +861,33 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
                        );
     }
 
-    // Render search
+    // Render search - highlights every match in the buffer (dim), with
+    // the one the cursor is sitting on brighter so find-next/prev has an
+    // obvious "current match" to move from.
     {
-        if (editor->searching) {
+        if (editor->searching && editor->search.count > 0) {
             simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
-            Vec4f selection_color = vec4f(.10, .10, .25, 1);
-            Vec2f p1 = cursor_pos;
-            Vec2f p2 = p1;
-            free_glyph_atlas_measure_line_sized(editor->atlas, editor->search.items, editor->search.count, &p2);
-            simple_renderer_solid_rect(sr, p1, vec2f(p2.x - p1.x, FREE_GLYPH_FONT_SIZE), selection_color);
+            Vec4f current_color = hex_to_vec4f(editor->theme.search_current);
+            Vec4f other_color = hex_to_vec4f(editor->theme.search_other);
+
+            for (size_t row = 0; row < editor->lines.count; ++row) {
+                Line line = editor->lines.items[row];
+                size_t line_len = line.end - line.begin;
+                if (line_len < editor->search.count) continue;
+
+                Vec2f row_origin = vec2f(0, -((float) row + CURSOR_OFFSET) * FREE_GLYPH_FONT_SIZE);
+                for (size_t col = 0; col + editor->search.count <= line_len; ++col) {
+                    size_t pos = line.begin + col;
+                    if (!editor_search_matches_at(editor, pos)) continue;
+
+                    Vec2f p1 = row_origin;
+                    p1.x = free_glyph_atlas_cursor_pos(atlas, editor->data.items + line.begin, line_len, row_origin, col);
+                    Vec2f p2 = p1;
+                    free_glyph_atlas_measure_line_sized(atlas, editor->data.items + pos, editor->search.count, &p2);
+                    simple_renderer_solid_rect(sr, p1, vec2f(p2.x - p1.x, FREE_GLYPH_FONT_SIZE),
+                                                pos == editor->cursor ? current_color : other_color);
+                }
+            }
             simple_renderer_flush(sr);
         }
     }
@@ -877,19 +898,19 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         for (size_t i = 0; i < editor->tokens.count; ++i) {
             Token token = editor->tokens.items[i];
             Vec2f pos = token.position;
-            Vec4f color = vec4fs(1);
+            Vec4f color = hex_to_vec4f(editor->theme.fg);
             switch (token.kind) {
             case TOKEN_PREPROC:
-                color = hex_to_vec4f(0x95A99FFF);
+                color = hex_to_vec4f(editor->theme.preproc);
                 break;
             case TOKEN_KEYWORD:
-                color = hex_to_vec4f(0xFFDD33FF);
+                color = hex_to_vec4f(editor->theme.accent);
                 break;
             case TOKEN_COMMENT:
-                color = hex_to_vec4f(0xCC8C3CFF);
+                color = hex_to_vec4f(editor->theme.comment);
                 break;
             case TOKEN_STRING:
-                color = hex_to_vec4f(0x73c936ff);
+                color = hex_to_vec4f(editor->theme.string);
                 break;
             default:
             {}
@@ -919,7 +940,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
             uint32_t cp = ' ';
             if (editor->cursor < editor->data.count) {
                 size_t len = utf8_decode(editor->data.items + editor->cursor, editor->data.count - editor->cursor, &cp);
-                if (cp >= 32) {
+                if (cp > 32) {
                     cursor_glyph_bytes = editor->data.items + editor->cursor;
                     cursor_glyph_len = len;
                 }
@@ -937,7 +958,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
             simple_renderer_solid_rect(
                 sr,
                 cursor_pos, vec2f(CURSOR_WIDTH, FREE_GLYPH_FONT_SIZE),
-                vec4fs(1));
+                hex_to_vec4f(editor->theme.fg));
 
             if (cursor_glyph_bytes != NULL) {
                 // Terminal-style reverse video: redraw the character on
@@ -950,8 +971,8 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
                 // it would have without a cursor over it.
                 simple_renderer_flush(sr);
                 simple_renderer_set_shader(sr, SHADER_FOR_TEXT);
-                Vec2f glyph_pos = vec2f(cursor_pos.x, -(float) editor_cursor_row(editor) * FREE_GLYPH_FONT_SIZE);
-                free_glyph_atlas_render_line_sized(atlas, sr, cursor_glyph_bytes, cursor_glyph_len, &glyph_pos, hex_to_vec4f(0x181818FF));
+                Vec2f glyph_pos = vec2f(cursor_pos.x, -(float) cursor_row * FREE_GLYPH_FONT_SIZE);
+                free_glyph_atlas_render_line_sized(atlas, sr, cursor_glyph_bytes, cursor_glyph_len, &glyph_pos, hex_to_vec4f(editor->theme.bg));
                 simple_renderer_flush(sr);
                 simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
             }
@@ -986,7 +1007,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
         simple_renderer_set_shader(sr, SHADER_FOR_COLOR);
         for (size_t row = 0; row < editor->lines.count; ++row) {
             Vec2f bg_pos = vec2f(screen_left_x, -((float) row + CURSOR_OFFSET) * FREE_GLYPH_FONT_SIZE);
-            simple_renderer_solid_rect(sr, bg_pos, vec2f(gutter_x + gutter_w - screen_left_x, FREE_GLYPH_FONT_SIZE), vec4f(.13f, .13f, .13f, 1.0f));
+            simple_renderer_solid_rect(sr, bg_pos, vec2f(gutter_x + gutter_w - screen_left_x, FREE_GLYPH_FONT_SIZE), hex_to_vec4f(editor->theme.gutter_bg));
         }
         simple_renderer_flush(sr);
 
@@ -1003,7 +1024,7 @@ void editor_render(SDL_Window *window, Free_Glyph_Atlas *atlas, Simple_Renderer 
             free_glyph_atlas_measure_line_sized(atlas, buf, (size_t) len, &measure);
 
             Vec2f text_pos = vec2f(gutter_x + gutter_w - pad - measure.x, -(float) row * FREE_GLYPH_FONT_SIZE);
-            free_glyph_atlas_render_line_sized(atlas, sr, buf, (size_t) len, &text_pos, vec4f(.5f, .5f, .5f, 1.0f));
+            free_glyph_atlas_render_line_sized(atlas, sr, buf, (size_t) len, &text_pos, hex_to_vec4f(editor->theme.gutter_fg));
         }
         simple_renderer_flush(sr);
 
@@ -1101,12 +1122,7 @@ void editor_clipboard_paste(Editor *e)
 void editor_start_search(Editor *e)
 {
     if (e->searching) {
-        for (size_t pos = e->cursor + 1; pos < e->data.count; ++pos) {
-            if (editor_search_matches_at(e, pos)) {
-                e->cursor = pos;
-                break;
-            }
-        }
+        editor_find_next_match(e);
     } else {
         e->searching = true;
         if (e->selection) {
@@ -1121,6 +1137,7 @@ void editor_start_search(Editor *e)
 void editor_stop_search(Editor *e)
 {
     e->searching = false;
+    e->replacing = false;
 }
 
 bool editor_search_matches_at(Editor *e, size_t pos)
@@ -1132,6 +1149,124 @@ bool editor_search_matches_at(Editor *e, size_t pos)
         }
     }
     return true;
+}
+
+// Nearest match at-or-after `from`, wrapping past the end of the buffer
+// back to the start if none is found first; SIZE_MAX (via (size_t) -1)
+// if e->search doesn't occur anywhere. Shared by incremental search-as-
+// you-type and explicit find-next so both wrap the same way.
+size_t editor_search_next(Editor *e, size_t from)
+{
+    if (e->search.count == 0 || e->data.count < e->search.count) return (size_t) -1;
+    size_t limit = e->data.count - e->search.count; // last position a match could start at
+
+    for (size_t pos = from; pos <= limit; ++pos) {
+        if (editor_search_matches_at(e, pos)) return pos;
+    }
+    for (size_t pos = 0; pos < from && pos <= limit; ++pos) {
+        if (editor_search_matches_at(e, pos)) return pos;
+    }
+    return (size_t) -1;
+}
+
+// Nearest match strictly before `from`, wrapping past the start of the
+// buffer back to the end if none is found first; SIZE_MAX if e->search
+// doesn't occur anywhere.
+size_t editor_search_prev(Editor *e, size_t from)
+{
+    if (e->search.count == 0 || e->data.count < e->search.count) return (size_t) -1;
+    ptrdiff_t limit = (ptrdiff_t) (e->data.count - e->search.count);
+    ptrdiff_t start = (ptrdiff_t) from - 1;
+    if (start > limit) start = limit;
+
+    for (ptrdiff_t pos = start; pos >= 0; --pos) {
+        if (editor_search_matches_at(e, (size_t) pos)) return (size_t) pos;
+    }
+    for (ptrdiff_t pos = limit; pos > start; --pos) {
+        if (editor_search_matches_at(e, (size_t) pos)) return (size_t) pos;
+    }
+    return (size_t) -1;
+}
+
+void editor_find_next_match(Editor *e)
+{
+    if (!e->searching) return;
+    size_t pos = editor_search_next(e, e->cursor + 1);
+    if (pos != (size_t) -1) e->cursor = pos;
+}
+
+void editor_find_prev_match(Editor *e)
+{
+    if (!e->searching) return;
+    size_t pos = editor_search_prev(e, e->cursor);
+    if (pos != (size_t) -1) e->cursor = pos;
+}
+
+// Enters replace-text input (see editor_insert_buf/editor_backspace),
+// only meaningful once a search query already exists - there's nothing
+// to replace otherwise.
+void editor_start_replace(Editor *e)
+{
+    if (!e->searching || e->search.count == 0) return;
+    e->replacing = true;
+    e->replace.count = 0;
+}
+
+void editor_stop_replace(Editor *e)
+{
+    e->replacing = false;
+}
+
+// Replaces the match at the cursor with e->replace and advances to the
+// next match (wrapping), like a terminal find/replace's "replace, then
+// find next". No-op if the cursor isn't currently sitting on a match.
+bool editor_replace_current_match(Editor *e)
+{
+    if (!e->searching || e->search.count == 0) return false;
+    if (!editor_search_matches_at(e, e->cursor)) return false;
+
+    size_t pos = e->cursor;
+    editor_data_remove(e, pos, e->search.count);
+    editor_add_op(e, EDIT_DELETE, pos, e->search.items, e->search.count);
+    editor_data_insert_at(e, pos, e->replace.items, e->replace.count);
+    editor_add_op(e, EDIT_INSERT, pos, e->replace.items, e->replace.count);
+    e->cursor = pos + e->replace.count;
+    editor_retokenize(e);
+
+    size_t next = editor_search_next(e, e->cursor);
+    if (next != (size_t) -1) e->cursor = next;
+    return true;
+}
+
+// Replaces every occurrence of e->search with e->replace in one pass, left
+// to right, resuming each scan right after the just-inserted replacement
+// text (so a replacement that itself contains the search text can't loop
+// forever). Retokenizes once at the end rather than once per match - see
+// editor_indent for the same pattern. Returns how many were replaced.
+size_t editor_replace_all_matches(Editor *e)
+{
+    if (!e->searching || e->search.count == 0) return 0;
+
+    size_t count = 0;
+    size_t pos = 0;
+    while (pos + e->search.count <= e->data.count) {
+        if (editor_search_matches_at(e, pos)) {
+            editor_data_remove(e, pos, e->search.count);
+            editor_add_op(e, EDIT_DELETE, pos, e->search.items, e->search.count);
+            editor_data_insert_at(e, pos, e->replace.items, e->replace.count);
+            editor_add_op(e, EDIT_INSERT, pos, e->replace.items, e->replace.count);
+            pos += e->replace.count;
+            count += 1;
+        } else {
+            pos += 1;
+        }
+    }
+    if (count > 0) {
+        e->cursor = pos;
+        e->selection = false;
+        editor_retokenize(e);
+    }
+    return count;
 }
 
 void editor_move_to_begin(Editor *e)

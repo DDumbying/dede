@@ -720,6 +720,134 @@ int main(void)
     if (browser_handled) { printf("FAIL: Enter should not be claimed, so the caller's own open-file handling still runs\n"); failures++; }
     else printf("ok:   Enter falls through vim_handle_browser_key\n");
 
+    // ------------------------------------------------------------------
+    // File-browser incremental filter (Main track #5).
+    // ------------------------------------------------------------------
+    printf("\n--- file-browser incremental filter ---\n");
+
+    File_Browser fbf = {0};
+    const char *filter_names[] = {"apple.txt", "Banana.md", "cherry.c", "date.txt", "banana_split.txt"};
+    fbf.files.items = filter_names;
+    fbf.files.count = sizeof(filter_names) / sizeof(filter_names[0]);
+    sb_append_cstr(&fbf.dir_path, "/tmp");
+    sb_append_null(&fbf.dir_path);
+
+    CHECK_EQ("fb_visible_count with no active query is the full file count", fb_visible_count(&fbf), 5);
+
+    fb_start_search(&fbf);
+    if (!fbf.searching) { printf("FAIL: fb_start_search should activate searching\n"); failures++; }
+    else printf("ok:   fb_start_search activates searching\n");
+
+    sb_append_buf(&fbf.search, "ana", 3);
+    CHECK_EQ("filter 'ana' matches case-insensitively (Banana.md, banana_split.txt)", fb_visible_count(&fbf), 2);
+
+    fbf.cursor = 0;
+    const char *first_match = fb_file_path(&fbf);
+    if (first_match == NULL || strcmp(first_match, "/tmp/Banana.md") != 0) {
+        printf("FAIL: fb_file_path(cursor 0) under filter 'ana' -> got \"%s\", want \"/tmp/Banana.md\"\n", first_match ? first_match : "(null)");
+        failures++;
+    } else {
+        printf("ok:   fb_file_path(cursor 0) under filter 'ana' -> \"%s\"\n", first_match);
+    }
+
+    fbf.cursor = 1;
+    const char *second_match = fb_file_path(&fbf);
+    if (second_match == NULL || strcmp(second_match, "/tmp/banana_split.txt") != 0) {
+        printf("FAIL: fb_file_path(cursor 1) under filter 'ana' -> got \"%s\", want \"/tmp/banana_split.txt\"\n", second_match ? second_match : "(null)");
+        failures++;
+    } else {
+        printf("ok:   fb_file_path(cursor 1) under filter 'ana' -> \"%s\"\n", second_match);
+    }
+
+    fbf.cursor = 2;
+    if (fb_file_path(&fbf) != NULL) { printf("FAIL: fb_file_path(cursor 2) should be out of range under a 2-match filter\n"); failures++; }
+    else printf("ok:   fb_file_path(cursor 2) is out of range under a 2-match filter\n");
+
+    Vim_State bfv = vim_state_init();
+    bool deferred = vim_handle_browser_key(&bfv, &fbf, KEY(SDLK_j));
+    if (deferred) { printf("FAIL: vim_handle_browser_key should defer to filter typing while fb->searching\n"); failures++; }
+    else printf("ok:   vim_handle_browser_key defers 'j' to filter typing while searching\n");
+
+    fb_stop_search(&fbf);
+    if (fbf.searching || fbf.search.count != 0) { printf("FAIL: fb_stop_search should clear both searching and the query\n"); failures++; }
+    else printf("ok:   fb_stop_search clears searching and the query\n");
+    CHECK_EQ("fb_visible_count is back to the full file count after fb_stop_search", fb_visible_count(&fbf), 5);
+
+    // ------------------------------------------------------------------
+    // Search find-next/prev and replace/replace-all (Main track #4).
+    // ------------------------------------------------------------------
+    printf("\n--- search / replace ---\n");
+
+    Editor s = {0};
+    const char *stext = "cat cat cat";
+    sb_append_buf(&s.data, stext, strlen(stext));
+    build_lines(&s);
+
+    CHECK_EQ("search_next: no active query returns SIZE_MAX", editor_search_next(&s, 0), (size_t) -1);
+
+    s.searching = true;
+    sb_append_buf(&s.search, "cat", 3);
+
+    CHECK_EQ("search_next(0) finds the match at the cursor itself", editor_search_next(&s, 0), 0);
+    CHECK_EQ("search_next(1) finds the next occurrence", editor_search_next(&s, 1), 4);
+    CHECK_EQ("search_next(9) wraps around to the first occurrence", editor_search_next(&s, 9), 0);
+    CHECK_EQ("search_prev(0) wraps around to the last occurrence", editor_search_prev(&s, 0), 8);
+    CHECK_EQ("search_prev(8) finds the previous occurrence", editor_search_prev(&s, 8), 4);
+
+    s.cursor = 0;
+    editor_find_next_match(&s);
+    CHECK_EQ("find_next_match steps from the first to the second match", s.cursor, 4);
+    editor_find_next_match(&s);
+    CHECK_EQ("find_next_match steps to the third match", s.cursor, 8);
+    editor_find_next_match(&s);
+    CHECK_EQ("find_next_match wraps back to the first match", s.cursor, 0);
+    editor_find_prev_match(&s);
+    CHECK_EQ("find_prev_match wraps back to the last match", s.cursor, 8);
+
+    editor_start_replace(&s);
+    if (!s.replacing) { printf("FAIL: start_replace should activate with a non-empty search query\n"); failures++; }
+    else printf("ok:   start_replace activates with a non-empty search query\n");
+
+    Editor s_noquery = {0};
+    sb_append_buf(&s_noquery.data, stext, strlen(stext));
+    build_lines(&s_noquery);
+    s_noquery.searching = true;
+    editor_start_replace(&s_noquery);
+    if (s_noquery.replacing) { printf("FAIL: start_replace should refuse to activate with an empty search query\n"); failures++; }
+    else printf("ok:   start_replace refuses to activate with an empty search query\n");
+
+    s.cursor = 0;
+    sb_append_buf(&s.replace, "dog", 3);
+    bool replaced = editor_replace_current_match(&s);
+    if (!replaced) { printf("FAIL: replace_current_match should report success on a real match\n"); failures++; }
+    else printf("ok:   replace_current_match reports success on a real match\n");
+    CHECK_STR("replace_current_match rewrites the buffer", s.data.items, s.data.count, "dog cat cat");
+    CHECK_EQ("replace_current_match advances the cursor to the next match", s.cursor, 4);
+
+    Editor r = {0};
+    const char *rtext = "one cat two cat three cat";
+    sb_append_buf(&r.data, rtext, strlen(rtext));
+    build_lines(&r);
+    r.searching = true;
+    sb_append_buf(&r.search, "cat", 3);
+    sb_append_buf(&r.replace, "dog", 3);
+    size_t replaced_count = editor_replace_all_matches(&r);
+    CHECK_EQ("replace_all_matches replaces every occurrence", replaced_count, 3);
+    CHECK_STR("replace_all_matches rewrites the buffer", r.data.items, r.data.count, "one dog two dog three dog");
+
+    // A replacement that itself contains the search text (here "a" -> "aa")
+    // must not re-match its own output and loop forever - each replacement
+    // resumes scanning right after the text it just inserted.
+    Editor ov_r = {0};
+    sb_append_buf(&ov_r.data, "banana", strlen("banana"));
+    build_lines(&ov_r);
+    ov_r.searching = true;
+    sb_append_buf(&ov_r.search, "a", 1);
+    sb_append_buf(&ov_r.replace, "aa", 2);
+    size_t ov_count = editor_replace_all_matches(&ov_r);
+    CHECK_EQ("replace_all_matches with self-matching replacement terminates and finds every 'a'", ov_count, 3);
+    CHECK_STR("replace_all_matches doesn't re-match text it just inserted", ov_r.data.items, ov_r.data.count, "baanaanaa");
+
     if (failures == 0) {
         printf("\nALL CHECKS PASSED\n");
         return 0;
